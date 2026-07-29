@@ -1,0 +1,10 @@
+{
+  "platform": "damai",
+  "quantity": 1,
+  "priceStrategy": "CHEAPEST_FIRST",
+  "maxTotalFen": 50000,
+  "autoSubmitOrder": false,
+  "sessions": [],
+  "tiers": [],
+  "attendeeAliases": []
+}

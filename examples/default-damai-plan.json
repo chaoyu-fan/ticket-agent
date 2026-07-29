@@ -1,0 +1,9 @@
+{
+  "platform": "damai",
+  "quantity": 1,
+  "priceStrategy": "CHEAPEST_FIRST",
+  "autoSubmitOrder": false,
+  "sessions": [],
+  "tiers": [],
+  "attendeeAliases": []
+}
