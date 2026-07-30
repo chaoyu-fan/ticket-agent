@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import type { ElementHandle, Page } from "playwright-core";
@@ -102,6 +103,18 @@ test("trusted benchmark click always keeps actionability and forbids force", asy
     () => performTrustedBenchmarkHandleClick(handle, 0),
     /TRUSTED_CLICK_BENCHMARK_TIMEOUT_INVALID/
   );
+});
+
+test("trusted-click CLI rejects arguments before any server or browser work", () => {
+  const child = spawnSync(process.execPath, ["scripts/benchmark-trusted-click.mjs", "unexpected"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 10_000
+  });
+  assert.equal(child.signal, null);
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, "");
+  assert.equal(child.stderr, "TRUSTED_CLICK_BENCHMARK_ARGUMENTS_BLOCKED\n");
 });
 
 function reportFixture(): TrustedClickBenchmarkReport {
