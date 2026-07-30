@@ -6,5 +6,5 @@
   "autoSubmitOrder": false,
   "sessions": [],
   "tiers": [],
-  "attendeeAliases": []
+  "attendeeRefs": []
 }

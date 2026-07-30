@@ -3,6 +3,8 @@ import type { Locator, Page } from "playwright-core";
 import { collectPageSignals, extractFen, guardPage } from "./signals.js";
 import type {
   AdapterContext,
+  AdapterDomPredicate,
+  AdapterDomWaitPhase,
   AdapterPhase,
   AdapterStepResult,
   ApprovedSubmitContext,
@@ -18,6 +20,51 @@ type ChoiceMatch =
   | { kind: "none" }
   | { kind: "many" }
   | { kind: "one"; locator: Locator };
+
+const DAMAI_BLOCKING_DOM_PREDICATES = [
+  {
+    key: "captcha-visible",
+    selector: [
+      'iframe[src*="captcha" i]',
+      'iframe[src*="turnstile" i]',
+      'iframe[src*="challenge" i]',
+      'iframe[src*="geetest" i]',
+      '.cf-turnstile',
+      '[class*="captcha" i]',
+      '[class*="geetest" i]',
+      '[id*="captcha" i]',
+      '[id*="turnstile" i]',
+      '[data-testid="captcha"]',
+      '[data-testid="turnstile"]',
+      '[data-sitekey]'
+    ].join(", ")
+  },
+  {
+    key: "login-required-visible",
+    selector: '[data-testid="login-required"], form[action*="login" i]'
+  },
+  {
+    key: "sold-out-visible",
+    selector: '[data-testid="sold-out"], [aria-label*="售罄"]'
+  }
+] as const satisfies readonly AdapterDomPredicate[];
+
+const DAMAI_SALE_DOM_PREDICATES = [
+  ...DAMAI_BLOCKING_DOM_PREDICATES,
+  { key: "official-queue-visible", selector: '[data-testid="official-queue"]' }
+] as const satisfies readonly AdapterDomPredicate[];
+
+const DAMAI_QUEUE_DOM_PREDICATES = [
+  ...DAMAI_BLOCKING_DOM_PREDICATES,
+  {
+    key: "purchase-controls-visible",
+    selector: [
+      '[data-testid="session-option"]:not([disabled]):not([aria-disabled="true"])',
+      '[data-testid="tier-option"]:not([disabled]):not([aria-disabled="true"])',
+      '[data-testid="submit-order"]:not([disabled]):not([aria-disabled="true"])'
+    ].join(", ")
+  }
+] as const satisfies readonly AdapterDomPredicate[];
 
 function isDamaiHost(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^www\./, "");
@@ -692,6 +739,10 @@ export class DamaiAdapter implements TicketPlatformAdapter {
 
   supportsOfficialUrl(url: URL): boolean {
     return url.protocol === "https:" && isDamaiHost(url.hostname) && !url.username && !url.password && (url.port === "" || url.port === "443");
+  }
+
+  domWaitPredicates(phase: AdapterDomWaitPhase): readonly AdapterDomPredicate[] {
+    return phase === "sale" ? DAMAI_SALE_DOM_PREDICATES : DAMAI_QUEUE_DOM_PREDICATES;
   }
 
   async navigate(page: Page, url: string): Promise<void> {

@@ -5,9 +5,15 @@ import { pathToFileURL } from "node:url";
 import { normalizePlan, validatePlan } from "../core/policy.js";
 import type { Platform, RunState, WatchPlan, WatchPlanInput } from "../core/types.js";
 import { adapterFor } from "../adapters/index.js";
+import { assertAttendeePersistenceBoundary } from "../identity/attendee-ref.js";
+import {
+  MacOsKeychainAttendeeResolver,
+  type AttendeeResolver
+} from "../identity/attendee-resolver.js";
 import { launchMacChrome } from "./browser.js";
 import { ControllerClient, submitDenial } from "./controller-client.js";
 import { LocalRunner, prewarmDelayMs } from "./executor.js";
+import { runnerSafetyPolicy } from "./safety.js";
 import type { RunnerMode } from "./types.js";
 
 type CliMode = RunnerMode | "login-only";
@@ -20,18 +26,21 @@ interface CliArgs {
   controllerUrl?: string;
   runId?: string;
   confirmLive: boolean;
+  confirmRehearsal: boolean;
 }
 
 function usage(): string {
   return [
-    "Usage: npm run start:runner -- --dry-run|--mock|--live|--login-only [options]",
+    "Usage: npm run start:runner -- --dry-run|--mock|--rehearsal|--live|--login-only [options]",
     "",
     "  --dry-run       read-only; never clicks or submits",
     "  --mock          permits only a local mock URL",
+    "  --rehearsal     visible official-page selection; submit capability is absent",
     "  --live          permits only a matching official HTTPS URL",
     "  --login-only    open the dedicated visible live profile; zero purchase actions",
     "  --platform      required with --login-only; currently damai",
     "  --confirm-live  required together with --live",
+    "  --confirm-rehearsal  required together with --rehearsal",
     "  --plan          path to a WatchPlan/WatchPlanInput JSON file",
     "  --url           optional target override (validated by mode)",
     "  --controller-url  loopback controller URL; required for live",
@@ -48,9 +57,16 @@ export function parseRunnerArgs(argv: readonly string[]): CliArgs {
   let controllerUrl: string | undefined;
   let runId: string | undefined;
   let confirmLive = false;
+  let confirmRehearsal = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--dry-run" || arg === "--mock" || arg === "--live" || arg === "--login-only") {
+    if (
+      arg === "--dry-run" ||
+      arg === "--mock" ||
+      arg === "--rehearsal" ||
+      arg === "--live" ||
+      arg === "--login-only"
+    ) {
       const requestedMode = arg.slice(2) as CliMode;
       if (mode && mode !== requestedMode) throw new Error("Choose exactly one runner mode");
       mode = requestedMode;
@@ -60,6 +76,8 @@ export function parseRunnerArgs(argv: readonly string[]): CliArgs {
       platform = value;
     } else if (arg === "--confirm-live") {
       confirmLive = true;
+    } else if (arg === "--confirm-rehearsal") {
+      confirmRehearsal = true;
     } else if (arg === "--plan") {
       const value = argv[++index];
       if (!value) throw new Error("--plan requires a path");
@@ -82,17 +100,32 @@ export function parseRunnerArgs(argv: readonly string[]): CliArgs {
       throw new Error(`Unknown argument: ${arg}`);
     }
   }
-  if (!mode) throw new Error("An explicit --dry-run, --mock, --live, or --login-only mode is required");
+  if (!mode) throw new Error("An explicit --dry-run, --mock, --rehearsal, --live, or --login-only mode is required");
   if (mode === "live" && !confirmLive) throw new Error("--live requires --confirm-live");
+  if (mode === "rehearsal" && !confirmRehearsal) {
+    throw new Error("--rehearsal requires --confirm-rehearsal");
+  }
   if (mode === "login-only") {
     if (!platform) throw new Error("--login-only requires --platform damai");
     if (platform !== "damai") throw new Error("LOGIN_ONLY_NOT_READY:only damai is currently supported");
     if (!targetUrl) throw new Error("--login-only requires --url with an official HTTPS page");
-    if (planPath || controllerUrl || runId || confirmLive) {
+    if (planPath || controllerUrl || runId || confirmLive || confirmRehearsal) {
       throw new Error("--login-only cannot be combined with plan, controller, run, or live-confirmation options");
     }
   } else if (platform !== undefined) {
     throw new Error("--platform is only valid with --login-only");
+  }
+  if (mode === "rehearsal") {
+    if (confirmLive) throw new Error("--rehearsal cannot be combined with --confirm-live");
+    if (controllerUrl || runId) {
+      throw new Error("--rehearsal cannot be combined with controller or run options");
+    }
+    if (!planPath) throw new Error("--rehearsal requires --plan with an official event binding");
+  } else if (confirmRehearsal) {
+    throw new Error("--confirm-rehearsal is only valid with --rehearsal");
+  }
+  if (mode !== "live" && mode !== "login-only" && confirmLive) {
+    throw new Error("--confirm-live is only valid with --live");
   }
   return {
     mode,
@@ -101,7 +134,8 @@ export function parseRunnerArgs(argv: readonly string[]): CliArgs {
     ...(targetUrl === undefined ? {} : { targetUrl }),
     ...(controllerUrl === undefined ? {} : { controllerUrl }),
     ...(runId === undefined ? {} : { runId }),
-    confirmLive
+    confirmLive,
+    confirmRehearsal
   };
 }
 
@@ -156,16 +190,42 @@ async function readPlan(planPath: string | undefined): Promise<WatchPlan> {
     return toWatchPlan({ platform: "damai" });
   }
   const raw = JSON.parse(await fs.readFile(path.resolve(planPath), "utf8")) as WatchPlanInput | WatchPlan;
+  // Plan files may contain opaque refs only. Real labels are resolved from
+  // Mac Keychain during PREWARM and must never be read from disk.
+  assertAttendeePersistenceBoundary(raw);
   const validation = validatePlan(raw);
   if (!validation.ok) throw new Error(`PLAN_INVALID:${validation.errors.join("; ")}`);
   return toWatchPlan(raw);
 }
 
 export function assertLiveAdapterReady(mode: RunnerMode, plan: Pick<WatchPlan, "platform">): void {
-  if (mode !== "live") return;
   const adapter = adapterFor(plan.platform);
-  if (!adapter.implemented || !adapter.liveReady) {
+  if (mode === "rehearsal" && !adapter.implemented) {
+    throw new Error(`REHEARSAL_ADAPTER_NOT_READY:${plan.platform}:only an implemented visible-UI adapter may rehearse`);
+  }
+  if (runnerSafetyPolicy(mode).requireLiveReady && (!adapter.implemented || !adapter.liveReady)) {
     throw new Error(`LIVE_ADAPTER_NOT_READY:${plan.platform}:use mock or dry-run until the adapter is reviewed`);
+  }
+}
+
+/** Rehearsal may click reversible controls, so it requires an exact event binding. */
+export function assertRehearsalPlanBinding(
+  plan: Pick<WatchPlan, "officialUrl" | "eventId">,
+  targetUrl?: string
+): void {
+  if (!plan.officialUrl?.trim() || !plan.eventId?.trim()) {
+    throw new Error("REHEARSAL_EVENT_BINDING_REQUIRED:officialUrl and eventId must be present in the plan");
+  }
+  let planned: URL;
+  let requested: URL;
+  try {
+    planned = new URL(plan.officialUrl);
+    requested = new URL(targetUrl ?? plan.officialUrl);
+  } catch {
+    throw new Error("REHEARSAL_EVENT_BINDING_INVALID:officialUrl and target must be absolute URLs");
+  }
+  if (requested.href !== planned.href) {
+    throw new Error("REHEARSAL_TARGET_MISMATCH:--url must exactly match plan.officialUrl");
   }
 }
 
@@ -218,6 +278,48 @@ function runnerExitCode(result: Awaited<ReturnType<LocalRunner["run"]>>): number
   return result.state === "FAILED" || result.message.startsWith("RUNNER_FAILED:") ? 1 : 0;
 }
 
+/**
+ * Resolves labels only for official-page modes and scopes them to one browser
+ * operation. Dry-run and mock never invoke the resolver, even if one is
+ * injected by a test or caller.
+ */
+export async function withRuntimeAttendeeLabels<T>(
+  mode: RunnerMode,
+  plan: WatchPlan,
+  operation: (runtimePlan: WatchPlan) => Promise<T>,
+  resolver?: AttendeeResolver
+): Promise<T> {
+  if (mode === "dry-run" || mode === "mock" || (plan.attendeeRefs?.length ?? 0) === 0) {
+    return operation(plan);
+  }
+  if (plan.attendeeAliases.length !== 0) {
+    throw new Error("ATTENDEE_RUNTIME_BOUNDARY_INVALID:resolved labels must not arrive from persistence");
+  }
+
+  const resolution = await (resolver ?? new MacOsKeychainAttendeeResolver()).resolve({
+    platform: plan.platform,
+    attendeeRefs: plan.attendeeRefs,
+    phase: "PREWARM",
+    ...(plan.saleAt === undefined ? {} : { saleAt: plan.saleAt })
+  });
+  try {
+    return await resolution.withLabels(async (labels) => {
+      if (labels.length !== plan.attendeeRefs?.length) {
+        throw new Error("ATTENDEE_RESOLUTION_COUNT_MISMATCH");
+      }
+      const runtimeAliases = [...labels];
+      const runtimePlan: WatchPlan = { ...plan, attendeeAliases: runtimeAliases };
+      try {
+        return await operation(runtimePlan);
+      } finally {
+        runtimeAliases.fill("");
+      }
+    });
+  } finally {
+    resolution.dispose();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let args: CliArgs;
   try {
@@ -243,8 +345,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         await context.close();
       }
     }
+    const runnerMode: RunnerMode = args.mode;
 
-    const configuredController = args.controllerUrl ?? process.env.TICKET_AGENT_CONTROLLER_URL;
+    const configuredController = args.mode === "live"
+      ? args.controllerUrl ?? process.env.TICKET_AGENT_CONTROLLER_URL
+      : undefined;
     let controller: ControllerClient | undefined;
     let plan: WatchPlan;
     let runId: string;
@@ -262,6 +367,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       plan = await readPlan(args.planPath);
       runId = `local-${Date.now()}`;
     }
+    if (args.mode === "rehearsal") assertRehearsalPlanBinding(plan, args.targetUrl);
     const abortController = new AbortController();
     const abortRun = (): void => abortController.abort();
     process.once("SIGINT", abortRun);
@@ -320,56 +426,59 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       }
 
       if (abortController.signal.aborted) return 130;
-      const context = await launchMacChrome({ profileScope: args.mode === "live" ? "live" : "sandbox" });
-      try {
-        const page = await context.newPage();
-        const runner = new LocalRunner({
-          page,
-          signal: abortController.signal,
-          onEvent: async (event) => {
-            console.error(JSON.stringify(event));
-            await controller?.recordEvent(event);
-          },
-          ...(controller === undefined ? {} : {
-            checkRunActive: async ({ expectedState }: { expectedState: RunState }) => {
-              const loaded = await controller.loadRunPlan(runId);
-              const active = loaded.run.id === runId && loaded.plan.id === plan.id && loaded.run.state === expectedState;
-              return {
-                active,
-                ...(active ? {} : { message: `controller state is ${loaded.run.state}` })
-              };
+      return withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
+        // Keychain resolution has completed before this first browser action.
+        const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(runnerMode).profileScope });
+        try {
+          const page = await context.newPage();
+          const runner = new LocalRunner({
+            page,
+            signal: abortController.signal,
+            onEvent: async (event) => {
+              console.error(JSON.stringify(event));
+              await controller?.recordEvent(event);
             },
-            authorizeSubmit: async (input) => {
-              try {
-                const approvedRun = await controller.approveSubmit(input.runId, input.observedTotalFen);
-                if (
-                  approvedRun.planId !== input.plan.id ||
-                  approvedRun.observedTotalFen !== input.observedTotalFen
-                ) {
-                  return {
-                    allowed: false,
-                    state: "HUMAN_TAKEOVER",
-                    message: "Controller approval did not match the armed plan and verified total"
-                  } as const;
+            ...(controller === undefined ? {} : {
+              checkRunActive: async ({ expectedState }: { expectedState: RunState }) => {
+                const loaded = await controller.loadRunPlan(runId);
+                const active = loaded.run.id === runId && loaded.plan.id === plan.id && loaded.run.state === expectedState;
+                return {
+                  active,
+                  ...(active ? {} : { message: `controller state is ${loaded.run.state}` })
+                };
+              },
+              authorizeSubmit: async (input) => {
+                try {
+                  const approvedRun = await controller.approveSubmit(input.runId, input.observedTotalFen);
+                  if (
+                    approvedRun.planId !== input.plan.id ||
+                    approvedRun.observedTotalFen !== input.observedTotalFen
+                  ) {
+                    return {
+                      allowed: false,
+                      state: "HUMAN_TAKEOVER",
+                      message: "Controller approval did not match the armed plan and verified total"
+                    } as const;
+                  }
+                  return { allowed: true, approvedTotalFen: approvedRun.observedTotalFen } as const;
+                } catch (error) {
+                  return submitDenial(error);
                 }
-                return { allowed: true, approvedTotalFen: approvedRun.observedTotalFen } as const;
-              } catch (error) {
-                return submitDenial(error);
               }
-            }
-          })
-        });
-        const result = await runner.run({
-          runId,
-          plan,
-          mode: args.mode,
-          ...(args.targetUrl === undefined ? {} : { targetUrl: args.targetUrl })
-        });
-        console.log(JSON.stringify(result, null, 2));
-        return runnerExitCode(result);
-      } finally {
-        await context.close();
-      }
+            })
+          });
+          const result = await runner.run({
+            runId,
+            plan: runtimePlan,
+            mode: runnerMode,
+            ...(args.targetUrl === undefined ? {} : { targetUrl: args.targetUrl })
+          });
+          console.log(JSON.stringify(result, null, 2));
+          return runnerExitCode(result);
+        } finally {
+          await context.close();
+        }
+      });
     } finally {
       process.off("SIGINT", abortRun);
       process.off("SIGTERM", abortRun);

@@ -3,6 +3,10 @@ import test from "node:test";
 import { canAutoSubmit, normalizePlan, validatePlan } from "../src/core/policy.js";
 import { canTransition, transition } from "../src/core/state.js";
 import type { WatchPlan } from "../src/core/types.js";
+import { parseAttendeeRef } from "../src/identity/attendee-ref.js";
+
+const ATTENDEE_REF_A = parseAttendeeRef("attendee:v1:550e8400-e29b-41d4-a716-446655440000");
+const ATTENDEE_REF_B = parseAttendeeRef("attendee:v1:d9428888-122b-4c26-9f8b-6f2f1175e1f4");
 
 function completePlan(overrides: Partial<WatchPlan> = {}): WatchPlan {
   const now = "2026-07-28T00:00:00.000Z";
@@ -13,12 +17,14 @@ function completePlan(overrides: Partial<WatchPlan> = {}): WatchPlan {
     eventId: "123456",
     eventTitle: "测试演唱会 上海站",
     canonicalEventKey: "test-show-2026-shanghai",
+    saleAt: "2026-08-01T10:00:00+08:00",
     quantity: 1,
     requireAdjacent: false,
     sessions: [],
     tiers: [],
     priceStrategy: "CHEAPEST_FIRST",
-    attendeeAliases: ["本人"],
+    attendeeRefs: [ATTENDEE_REF_A],
+    attendeeAliases: ["local-display-a"],
     autoSubmitOrder: false,
     status: "DRAFT",
     createdAt: now,
@@ -39,7 +45,7 @@ test("未设置最高总价时禁止开启自动提交", () => {
   const validation = validatePlan({
     platform: "damai",
     officialUrl: "https://detail.damai.cn/item.htm?id=123456",
-    attendeeAliases: ["本人"],
+    attendeeRefs: [ATTENDEE_REF_A],
     autoSubmitOrder: true
   });
 
@@ -95,20 +101,22 @@ test("运行时计划校验拒绝未知策略和畸形数组而不抛异常", ()
   assert.throws(() => normalizePlan({ platform: "damai", tiers: "not-an-array" } as never), /PLAN_SHAPE_INVALID/);
 });
 
-test("自动提交要求观演人别名唯一且与票数完全一致", () => {
+test("自动提交要求 opaque attendeeRefs 唯一且与票数完全一致", () => {
   const common = {
     platform: "damai" as const,
     officialUrl: "https://detail.damai.cn/item.htm?id=123456",
     eventId: "123456",
     eventTitle: "测试演唱会 上海站",
     canonicalEventKey: "test-show-2026-shanghai",
+    saleAt: "2026-08-01T10:00:00+08:00",
     maxTotalFen: 100_000,
     quantity: 2,
     autoSubmitOrder: true
   };
-  assert.equal(validatePlan({ ...common, attendeeAliases: ["本人", "本人"] }).ok, false);
-  assert.equal(validatePlan({ ...common, attendeeAliases: ["甲", "乙", "丙"] }).ok, false);
-  assert.equal(validatePlan({ ...common, attendeeAliases: ["甲", "乙"] }).ok, true);
+  assert.equal(validatePlan({ ...common, attendeeRefs: [ATTENDEE_REF_A, ATTENDEE_REF_A] }).ok, false);
+  assert.equal(validatePlan({ ...common, attendeeRefs: [ATTENDEE_REF_A] }).ok, false);
+  assert.equal(validatePlan({ ...common, attendeeRefs: [ATTENDEE_REF_A, ATTENDEE_REF_B] }).ok, true);
+  assert.equal(validatePlan({ ...common, attendeeRefs: ["local-display-a", ATTENDEE_REF_B] as never }).ok, false);
 });
 
 test("自动提交要求稳定 canonical 身份并同时绑定活动 ID 和标题", () => {
@@ -118,8 +126,9 @@ test("自动提交要求稳定 canonical 身份并同时绑定活动 ID 和标�
     eventId: "123456",
     eventTitle: "测试演唱会 上海站",
     canonicalEventKey: "test-show-2026-shanghai",
+    saleAt: "2026-08-01T10:00:00+08:00",
     maxTotalFen: 100_000,
-    attendeeAliases: ["本人"],
+    attendeeRefs: [ATTENDEE_REF_A],
     autoSubmitOrder: true
   };
 
@@ -134,4 +143,17 @@ test("自动提交要求稳定 canonical 身份并同时绑定活动 ID 和标�
     delete incomplete[field];
     assert.equal(canAutoSubmit(incomplete, 38_000), false, field);
   }
+});
+
+test("自动提交必须绑定带时区的 saleAt 作为最早提交时间", () => {
+  const complete = completePlan({ autoSubmitOrder: true, maxTotalFen: 100_000 });
+  assert.equal(validatePlan(complete).ok, true);
+  assert.equal(canAutoSubmit(complete, 38_000), true);
+
+  const missing = { ...complete };
+  delete missing.saleAt;
+  const validation = validatePlan(missing);
+  assert.equal(validation.ok, false);
+  assert.ok(validation.errors.includes("autoSubmitOrder requires saleAt with an explicit timezone"));
+  assert.equal(canAutoSubmit(missing, 38_000), false);
 });

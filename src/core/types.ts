@@ -1,3 +1,5 @@
+import type { AttendeeRef } from "../identity/attendee-ref.js";
+
 export type Platform = "damai" | "maoyan";
 
 export type PriceStrategy = "CHEAPEST_FIRST" | "PREFERRED_ORDER";
@@ -54,6 +56,10 @@ export interface WatchPlanInput {
   tiers?: TierPreference[];
   maxTotalFen?: number;
   priceStrategy?: PriceStrategy;
+  /** Opaque Mac-local Keychain handles. Safe to persist and synchronize. */
+  /** Untrusted JSON uses strings; normalizePlan validates and brands them. */
+  attendeeRefs?: string[];
+  /** @deprecated Runtime-only resolved labels. Never persist a non-empty value. */
   attendeeAliases?: string[];
   autoSubmitOrder?: boolean;
 }
@@ -72,6 +78,9 @@ export interface WatchPlan {
   tiers: TierPreference[];
   maxTotalFen?: number;
   priceStrategy: PriceStrategy;
+  /** Normalized controller plans always provide this field. */
+  attendeeRefs?: AttendeeRef[];
+  /** Runtime-only labels resolved from Mac Keychain during PREWARM. */
   attendeeAliases: string[];
   autoSubmitOrder: boolean;
   status: PlanStatus;

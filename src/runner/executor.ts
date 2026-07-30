@@ -1,5 +1,6 @@
 import { adapterFor } from "../adapters/index.js";
 import type {
+  AdapterDomWaitPhase,
   AdapterPhase,
   AdapterStepResult,
   PageSignals,
@@ -9,7 +10,8 @@ import { validatePlan } from "../core/policy.js";
 import { canTransition } from "../core/state.js";
 import type { RunnerEvent, RunState, WatchPlan } from "../core/types.js";
 
-import { checkObservedTarget, checkRunTarget } from "./safety.js";
+import { checkObservedTarget, checkRunTarget, runnerSafetyPolicy } from "./safety.js";
+import { waitForDomPredicate } from "./dom-event.js";
 import type { LocalRunnerOptions, LocalRunnerRequest, LocalRunnerResult } from "./types.js";
 
 const ACTION_PHASES: readonly {
@@ -25,6 +27,13 @@ const ACTION_PHASES: readonly {
 
 export const DEFAULT_PREWARM_WINDOW_MS = 10 * 60 * 1_000;
 export const DEFAULT_QUEUE_POLL_INTERVAL_MS = 2_000;
+export const DEFAULT_QUEUE_DOM_WATCHDOG_MS = 30_000;
+
+function isNavigationContextChange(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:execution context was destroyed|cannot find context|frame was detached).*(?:navigation|navigat)/i.test(message) ||
+    /most likely because of a navigation/i.test(message);
+}
 
 function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("RUN_ABORTED"));
@@ -98,6 +107,7 @@ export class LocalRunner {
   }
 
   async run(request: LocalRunnerRequest): Promise<LocalRunnerResult> {
+    const safetyPolicy = runnerSafetyPolicy(request.mode);
     const events: RunnerEvent[] = [];
     let current: RunState = "SCHEDULED";
     let observedTotalFen: number | undefined;
@@ -112,6 +122,9 @@ export class LocalRunner {
       extra: Partial<RunnerEvent> = {},
       notifyController = true
     ): Promise<void> => {
+      if (!safetyPolicy.allowSubmitOrder && (state === "SUBMIT_ORDER" || state === "PAY_REQUIRED")) {
+        throw new Error(`MODE_CAPABILITY_BLOCKED:${request.mode}:${state}`);
+      }
       if (!canTransition(current, state)) throw new Error(`INVALID_RUNNER_TRANSITION:${current}->${state}`);
       const event: RunnerEvent = {
         runId: request.runId,
@@ -208,12 +221,12 @@ export class LocalRunner {
       await emit("FAILED", message);
       return result(message);
     }
-    if (request.mode === "live" && !adapter.liveReady) {
+    if (safetyPolicy.requireLiveReady && !adapter.liveReady) {
       const message = `LIVE_ADAPTER_NOT_READY:${request.plan.platform}:use mock or dry-run until reviewed`;
       await emit("FAILED", message);
       return result(message);
     }
-    if (request.mode === "live" && !adapter.supportsOfficialUrl(targetCheck.url)) {
+    if (safetyPolicy.targetScope === "official" && !adapter.supportsOfficialUrl(targetCheck.url)) {
       const message = `PLATFORM_URL_MISMATCH:${request.plan.platform}`;
       await emit("FAILED", message);
       return result(message);
@@ -288,6 +301,68 @@ export class LocalRunner {
       return { signals };
     };
 
+    const waitForAdapterDomWake = async (
+      phase: AdapterDomWaitPhase,
+      timeoutMs: number,
+      label: string
+    ) => {
+      const predicates = adapter.domWaitPredicates?.(phase) ?? [];
+      if (predicates.length === 0) return { kind: "unsupported" as const };
+
+      const cancellation = new AbortController();
+      const abortForRunner = (): void => cancellation.abort();
+      this.signal?.addEventListener("abort", abortForRunner, { once: true });
+      if (this.signal?.aborted) cancellation.abort();
+
+      const domWait = waitForDomPredicate(page, {
+        predicates,
+        timeoutMs,
+        signal: cancellation.signal
+      }).then((result) => ({ kind: "dom" as const, result })).catch((error: unknown) => {
+        if (isNavigationContextChange(error)) return { kind: "context-changed" as const };
+        throw error;
+      });
+
+      // Keep controller cancellation and the official-host boundary responsive
+      // while one MutationObserver remains resident in the browser. This loop
+      // never inspects DOM, refreshes, navigates, or opens another page.
+      const monitor = (async () => {
+        for (;;) {
+          try {
+            await defaultSleep(this.queuePollIntervalMs, cancellation.signal);
+          } catch (error) {
+            if (cancellation.signal.aborted) return { kind: "monitor-cancelled" as const };
+            throw error;
+          }
+          if (this.checkRunActive) {
+            const status = await this.checkRunActive({ runId: request.runId, expectedState: current });
+            // The DOM event may have won while the controller request was in
+            // flight. Never let a stale liveness response mutate the run.
+            if (cancellation.signal.aborted) return { kind: "monitor-cancelled" as const };
+            if (!status.active) {
+              const message = `RUN_NO_LONGER_ACTIVE:${status.message ?? "controller stopped or replaced this run"}`;
+              await emit("FAILED", message, totalEvent(observedTotalFen), false);
+              return { kind: "stopped" as const, stopped: result(message) };
+            }
+          }
+          if (cancellation.signal.aborted) return { kind: "monitor-cancelled" as const };
+          const boundary = await checkTargetBoundary(`during ${label} DOM wait`);
+          if (boundary) return { kind: "stopped" as const, stopped: boundary };
+        }
+      })();
+
+      try {
+        const winner = await Promise.race([domWait, monitor]);
+        if (winner.kind === "monitor-cancelled") return await domWait;
+        return winner;
+      } finally {
+        cancellation.abort();
+        this.signal?.removeEventListener("abort", abortForRunner);
+        void domWait.catch(() => undefined);
+        void monitor.catch(() => undefined);
+      }
+    };
+
     try {
       await emit("PREWARM", "Opening the official visible page");
       let stopped = await checkTargetBoundary("before navigation", targetCheck.url.href);
@@ -322,11 +397,25 @@ export class LocalRunner {
         const saleTime = Date.parse(request.plan.saleAt);
         let waitFor = saleTime - this.now().getTime();
         while (Number.isFinite(saleTime) && waitFor > 0 && !signals.inOfficialQueue) {
-          await this.sleep(Math.min(waitFor, this.queuePollIntervalMs));
-          stopped = await stopIfExternallyInactive();
-          if (stopped) return stopped;
-          stopped = await checkTargetBoundary("after waiting for sale time");
-          if (stopped) return stopped;
+          const wake = await waitForAdapterDomWake("sale", Math.max(1, waitFor), "sale");
+          if (wake.kind === "unsupported") {
+            // Unreviewed/legacy adapters retain the original serial fallback.
+            await this.sleep(Math.min(waitFor, this.queuePollIntervalMs));
+            stopped = await stopIfExternallyInactive();
+            if (stopped) return stopped;
+            stopped = await checkTargetBoundary("after waiting for sale time");
+            if (stopped) return stopped;
+          } else {
+            if (wake.kind === "stopped") return wake.stopped;
+            if (wake.kind === "dom" && wake.result.outcome === "aborted") throw new Error("RUN_ABORTED");
+            stopped = await checkTargetBoundary("after event-driven sale wait");
+            if (stopped) return stopped;
+            if (wake.kind === "dom" && wake.result.outcome === "timeout") {
+              waitFor = saleTime - this.now().getTime();
+              continue;
+            }
+          }
+
           inspection = await inspect("prewarm", "sale wait");
           if ("stopped" in inspection) return inspection.stopped;
           signals = inspection.signals;
@@ -338,11 +427,23 @@ export class LocalRunner {
               guard.observedTotalFen
             );
           }
+          if (
+            wake.kind === "dom" &&
+            wake.result.outcome === "matched" &&
+            !signals.inOfficialQueue
+          ) {
+            return stopForGuard(
+              "PAGE_CHANGED",
+              `DOM_EVENT_UNCORROBORATED:${wake.result.key}`,
+              guard.observedTotalFen
+            );
+          }
           waitFor = saleTime - this.now().getTime();
         }
       }
 
       await emit("OFFICIAL_QUEUE", "Following the visible official queue");
+      let pendingQueueWakeKey: string | undefined;
       for (;;) {
         stopped = await stopIfExternallyInactive();
         if (stopped) return stopped;
@@ -354,23 +455,45 @@ export class LocalRunner {
           return stopForGuard(guard.state, guard.message ?? "Queue guard stopped the run", guard.observedTotalFen);
         }
         if (!signals.inOfficialQueue) break;
-        if (request.mode !== "live") {
+        if (pendingQueueWakeKey !== undefined) {
+          return stopForGuard(
+            "PAGE_CHANGED",
+            `DOM_EVENT_UNCORROBORATED:${pendingQueueWakeKey}`,
+            guard.observedTotalFen
+          );
+        }
+        if (!safetyPolicy.allowOfficialQueueWait) {
           return stopForGuard(
             "HUMAN_TAKEOVER",
             "Official queue is active; only an explicitly confirmed live run may wait",
             guard.observedTotalFen
           );
         }
-        await this.sleep(this.queuePollIntervalMs);
-        stopped = await stopIfExternallyInactive();
-        if (stopped) return stopped;
-        stopped = await checkTargetBoundary("during official queue wait");
+        const wake = await waitForAdapterDomWake(
+          "queue",
+          DEFAULT_QUEUE_DOM_WATCHDOG_MS,
+          "official queue"
+        );
+        if (wake.kind === "unsupported") {
+          await this.sleep(this.queuePollIntervalMs);
+          stopped = await stopIfExternallyInactive();
+          if (stopped) return stopped;
+          stopped = await checkTargetBoundary("during official queue wait");
+          if (stopped) return stopped;
+          continue;
+        }
+        if (wake.kind === "stopped") return wake.stopped;
+        if (wake.kind === "dom") {
+          if (wake.result.outcome === "aborted") throw new Error("RUN_ABORTED");
+          if (wake.result.outcome === "matched") pendingQueueWakeKey = wake.result.key;
+        }
+        stopped = await checkTargetBoundary("after event-driven official queue wait");
         if (stopped) return stopped;
       }
 
       // Dry-run is inspection-only. It records planned checkpoints while
       // guaranteeing that no selection or submit adapter method is called.
-      if (request.mode === "dry-run") {
+      if (!safetyPolicy.allowSelection) {
         for (const item of ACTION_PHASES) {
           await emit(item.state, `Dry-run checkpoint: ${item.phase}; no control was clicked`);
         }
@@ -472,10 +595,14 @@ export class LocalRunner {
         ...(adjacentVerified === undefined ? {} : { adjacentVerified })
       });
 
-      // mock and dry-run can never emit SUBMIT_ORDER or call submitOrder,
-      // regardless of plan.autoSubmitOrder or a supplied authorization hook.
-      if (request.mode !== "live") {
-        const message = "Mock mode complete; live submission is unconditionally disabled";
+      // Mock and rehearsal modes can never authorize or submit, regardless of
+      // plan.autoSubmitOrder or a supplied authorization hook. Rehearsal is
+      // deliberately allowed to reach this point using the visible live
+      // profile so selectors and checkout evidence can be reviewed safely.
+      if (!safetyPolicy.allowSubmitAuthorization || !safetyPolicy.allowSubmitOrder) {
+        const message = request.mode === "rehearsal"
+          ? "Rehearsal complete; submit authorization and order submission are unavailable"
+          : "Mock mode complete; live submission is unconditionally disabled";
         await emit("REVIEW_REQUIRED", message, totalEvent(observedTotalFen));
         return result(message);
       }

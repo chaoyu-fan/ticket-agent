@@ -1,3 +1,4 @@
+import { isAttendeeRef, parseAttendeeRef } from "../identity/attendee-ref.js";
 import type { PlanValidation, WatchPlan, WatchPlanInput } from "./types.js";
 
 const PRICE_STRATEGIES = new Set(["CHEAPEST_FIRST", "PREFERRED_ORDER"] as const);
@@ -65,6 +66,13 @@ export function validatePlanShape(input: unknown): string[] {
   if (input.priceStrategy !== undefined && typeof input.priceStrategy !== "string") {
     errors.push("priceStrategy must be a string");
   }
+  if (input.attendeeRefs !== undefined) {
+    if (!Array.isArray(input.attendeeRefs)) {
+      errors.push("attendeeRefs must be an array");
+    } else if (input.attendeeRefs.some((ref) => !isAttendeeRef(ref))) {
+      errors.push("attendeeRefs must contain only canonical opaque references");
+    }
+  }
   if (input.attendeeAliases !== undefined) {
     if (!Array.isArray(input.attendeeAliases) || input.attendeeAliases.some((alias) => typeof alias !== "string")) {
       errors.push("attendeeAliases must be an array of strings");
@@ -102,6 +110,7 @@ export function normalizePlan(input: WatchPlanInput): Omit<WatchPlan, "id" | "st
       .sort((a, b) => a.priority - b.priority),
     ...(input.maxTotalFen === undefined ? {} : { maxTotalFen: input.maxTotalFen }),
     priceStrategy: input.priceStrategy ?? "CHEAPEST_FIRST",
+    attendeeRefs: [...(input.attendeeRefs ?? [])].map((ref) => parseAttendeeRef(ref)),
     attendeeAliases: [...(input.attendeeAliases ?? [])].map((alias) => alias.trim()),
     autoSubmitOrder: input.autoSubmitOrder ?? false
   };
@@ -156,6 +165,16 @@ export function validatePlan(plan: WatchPlanInput | WatchPlan): PlanValidation {
     if (aliasKeys.has(key)) errors.push("attendee aliases must be unique");
     aliasKeys.add(key);
   }
+  const attendeeRefs = plan.attendeeRefs ?? [];
+  const refKeys = new Set<string>();
+  for (const ref of attendeeRefs) {
+    if (!isAttendeeRef(ref)) {
+      errors.push("attendeeRefs must contain only canonical opaque references");
+      continue;
+    }
+    if (refKeys.has(ref)) errors.push("attendeeRefs must be unique");
+    refKeys.add(ref);
+  }
   const priceStrategy = plan.priceStrategy ?? "CHEAPEST_FIRST";
   if (!PRICE_STRATEGIES.has(priceStrategy as "CHEAPEST_FIRST" | "PREFERRED_ORDER")) {
     errors.push("priceStrategy must be CHEAPEST_FIRST or PREFERRED_ORDER");
@@ -166,6 +185,7 @@ export function validatePlan(plan: WatchPlanInput | WatchPlan): PlanValidation {
   if (plan.autoSubmitOrder) {
     if (plan.maxTotalFen === undefined) errors.push("autoSubmitOrder requires maxTotalFen");
     if (!plan.officialUrl) errors.push("autoSubmitOrder requires an officialUrl");
+    if (!plan.saleAt) errors.push("autoSubmitOrder requires saleAt with an explicit timezone");
     if (!plan.canonicalEventKey || !normalizedIdentity(plan.canonicalEventKey)) {
       errors.push("autoSubmitOrder requires a non-empty canonicalEventKey");
     }
@@ -175,16 +195,21 @@ export function validatePlan(plan: WatchPlanInput | WatchPlan): PlanValidation {
     if (!plan.eventTitle || !normalizedIdentity(plan.eventTitle)) {
       errors.push("autoSubmitOrder requires a non-empty eventTitle");
     }
-    if (aliases.length !== quantity) errors.push("autoSubmitOrder requires exactly one unique attendee alias per ticket");
+    if (attendeeRefs.length !== quantity) {
+      errors.push("autoSubmitOrder requires exactly one unique opaque attendeeRef per ticket");
+    }
   }
   return { ok: errors.length === 0, errors };
 }
 
 export function canAutoSubmit(plan: WatchPlan, observedTotalFen: number): boolean {
   if (!plan.autoSubmitOrder || plan.maxTotalFen === undefined) return false;
+  if (!plan.saleAt || !Number.isFinite(Date.parse(plan.saleAt))) return false;
   if (!plan.canonicalEventKey || !normalizedIdentity(plan.canonicalEventKey)) return false;
   if (!plan.eventId || !normalizedIdentity(plan.eventId)) return false;
   if (!plan.eventTitle || !normalizedIdentity(plan.eventTitle)) return false;
+  if ((plan.attendeeRefs?.length ?? 0) !== plan.quantity) return false;
+  if (new Set(plan.attendeeRefs).size !== plan.quantity) return false;
   if (!Number.isSafeInteger(observedTotalFen) || observedTotalFen < 0) return false;
   return observedTotalFen <= plan.maxTotalFen;
 }

@@ -8,6 +8,8 @@ import type { Page } from "playwright-core";
 import { guardPage } from "../src/adapters/signals.js";
 import type {
   AdapterContext,
+  AdapterDomPredicate,
+  AdapterDomWaitPhase,
   AdapterPhase,
   AdapterStepResult,
   ApprovedSubmitContext,
@@ -16,11 +18,14 @@ import type {
   TicketPlatformAdapter
 } from "../src/adapters/types.js";
 import type { WatchPlan } from "../src/core/types.js";
+import { parseAttendeeRef } from "../src/identity/attendee-ref.js";
 import { DEFAULT_MAC_CHROME_PATH, macChromeLaunchOptions, resolveMacProfileDir } from "../src/runner/browser.js";
-import { parseRunnerArgs, waitForPrewarmWindow } from "../src/runner/cli.js";
+import { assertRehearsalPlanBinding, parseRunnerArgs, waitForPrewarmWindow } from "../src/runner/cli.js";
 import { LocalRunner, prewarmDelayMs } from "../src/runner/executor.js";
 import type { LocalRunnerResult } from "../src/runner/types.js";
-import { checkObservedTarget, checkRunTarget } from "../src/runner/safety.js";
+import { checkObservedTarget, checkRunTarget, runnerSafetyPolicy } from "../src/runner/safety.js";
+
+const TEST_ATTENDEE_REF = parseAttendeeRef("attendee:v1:123e4567-e89b-42d3-a456-426614174000");
 
 function plan(overrides: Partial<WatchPlan> = {}): WatchPlan {
   const now = "2026-07-28T00:00:00.000Z";
@@ -32,6 +37,7 @@ function plan(overrides: Partial<WatchPlan> = {}): WatchPlan {
     sessions: [],
     tiers: [],
     priceStrategy: "CHEAPEST_FIRST",
+    attendeeRefs: [],
     attendeeAliases: [],
     autoSubmitOrder: false,
     status: "ARMED",
@@ -47,7 +53,9 @@ function autoLivePlan(overrides: Partial<WatchPlan> = {}): WatchPlan {
     eventId: "123",
     eventTitle: "Mock event",
     canonicalEventKey: "mock-event-123",
+    saleAt: "2026-07-30T00:00:00.000Z",
     maxTotalFen: 50_000,
+    attendeeRefs: [TEST_ATTENDEE_REF],
     attendeeAliases: ["本人"],
     autoSubmitOrder: true,
     ...overrides
@@ -73,12 +81,31 @@ function signals(overrides: Partial<PageSignals> = {}): PageSignals {
 
 type MutableFakePage = Page & { setUrl(url: string): void };
 
+type EventDrivenFakePage = MutableFakePage & { readonly evaluateCount: number };
+
 function fakePage(initialUrl = "about:blank"): MutableFakePage {
   let currentUrl = initialUrl;
   return {
     url: () => currentUrl,
     setUrl: (url: string) => { currentUrl = url; }
   } as unknown as MutableFakePage;
+}
+
+function eventDrivenFakePage(
+  onEvaluate: () => unknown,
+  initialUrl = "about:blank"
+): EventDrivenFakePage {
+  let currentUrl = initialUrl;
+  let evaluateCount = 0;
+  return {
+    url: () => currentUrl,
+    setUrl: (url: string) => { currentUrl = url; },
+    get evaluateCount() { return evaluateCount; },
+    evaluate: async () => {
+      evaluateCount += 1;
+      return onEvaluate();
+    }
+  } as unknown as EventDrivenFakePage;
 }
 
 function assertResultConsistent(result: LocalRunnerResult): void {
@@ -133,6 +160,10 @@ class FakeDamaiAdapter implements TicketPlatformAdapter {
     return guardPage(pageSignals, phase, watchPlan);
   }
 
+  domWaitPredicates(_phase: AdapterDomWaitPhase): readonly AdapterDomPredicate[] {
+    return [];
+  }
+
   private action(
     context: AdapterContext,
     phase: Extract<AdapterPhase, "session" | "tier" | "quantity" | "attendee">
@@ -161,11 +192,63 @@ class FakeDamaiAdapter implements TicketPlatformAdapter {
   }
 }
 
+class EventDrivenFakeDamaiAdapter extends FakeDamaiAdapter {
+  override domWaitPredicates(_phase: AdapterDomWaitPhase): readonly AdapterDomPredicate[] {
+    return [{ key: "visible-state-change", selector: "[data-visible-state-change]" }];
+  }
+}
+
 test("runner mode is explicit and live mode requires a second confirmation", () => {
   assert.throws(() => parseRunnerArgs([]), /explicit/);
   assert.throws(() => parseRunnerArgs(["--live"]), /confirm-live/);
   assert.equal(parseRunnerArgs(["--dry-run"]).mode, "dry-run");
   assert.equal(parseRunnerArgs(["--live", "--confirm-live"]).mode, "live");
+});
+
+test("rehearsal requires its own confirmation and excludes live/controller capabilities", () => {
+  const planPath = "examples/damai-iwwf-readonly-plan.json";
+  assert.throws(() => parseRunnerArgs(["--rehearsal", "--plan", planPath]), /confirm-rehearsal/);
+  assert.equal(
+    parseRunnerArgs(["--rehearsal", "--confirm-rehearsal", "--plan", planPath]).mode,
+    "rehearsal"
+  );
+  assert.throws(
+    () => parseRunnerArgs(["--rehearsal", "--confirm-rehearsal", "--confirm-live", "--plan", planPath]),
+    /cannot be combined with --confirm-live/
+  );
+  assert.throws(
+    () => parseRunnerArgs([
+      "--rehearsal",
+      "--confirm-rehearsal",
+      "--plan",
+      planPath,
+      "--controller-url",
+      "http://127.0.0.1:4317"
+    ]),
+    /cannot be combined with controller/
+  );
+  assert.throws(
+    () => parseRunnerArgs(["--rehearsal", "--live", "--confirm-rehearsal", "--plan", planPath]),
+    /Choose exactly one runner mode/
+  );
+});
+
+test("rehearsal requires a plan-bound event ID and exact official URL", () => {
+  const bound = plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123", eventId: "123" });
+  assert.doesNotThrow(() => assertRehearsalPlanBinding(bound));
+  assert.doesNotThrow(() => assertRehearsalPlanBinding(bound, bound.officialUrl));
+  assert.throws(
+    () => assertRehearsalPlanBinding(plan({ eventId: "123" })),
+    /REHEARSAL_EVENT_BINDING_REQUIRED/
+  );
+  assert.throws(
+    () => assertRehearsalPlanBinding(plan({ officialUrl: bound.officialUrl! })),
+    /REHEARSAL_EVENT_BINDING_REQUIRED/
+  );
+  assert.throws(
+    () => assertRehearsalPlanBinding(bound, "https://detail.damai.cn/item.htm?id=456"),
+    /REHEARSAL_TARGET_MISMATCH/
+  );
 });
 
 test("target policy permits only loopback mocks and matching official live URLs", () => {
@@ -180,6 +263,25 @@ test("target policy permits only loopback mocks and matching official live URLs"
   assert.equal(checkObservedTarget(p, "live", "https://damai.cn.example.com/order/1").ok, false);
   assert.equal(checkObservedTarget(p, "mock", "http://localhost:4173/damai/normal").ok, true);
   assert.equal(checkObservedTarget(p, "mock", "https://detail.damai.cn/item.htm?id=123").ok, false);
+});
+
+test("rehearsal policy uses the live profile and official host without submit or controller capabilities", () => {
+  const p = plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" });
+  const policy = runnerSafetyPolicy("rehearsal");
+  assert.equal(Object.isFrozen(policy), true);
+  assert.equal(policy.profileScope, "live");
+  assert.equal(policy.allowSelection, true);
+  assert.equal(policy.allowController, false);
+  assert.equal(policy.allowSubmitAuthorization, false);
+  assert.equal(policy.allowSubmitOrder, false);
+  assert.equal(policy.requireLiveReady, false);
+
+  assert.equal(checkRunTarget(p, "rehearsal", p.officialUrl).ok, true);
+  assert.equal(checkRunTarget(p, "rehearsal", "http://127.0.0.1:4173/damai/normal").ok, false);
+  assert.equal(checkRunTarget(p, "rehearsal", "https://www.damai.cn/other").ok, false);
+  assert.equal(checkRunTarget(p, "rehearsal", "https://damai.cn.example.com/item/123").ok, false);
+  assert.equal(checkObservedTarget(p, "rehearsal", "https://buy.damai.cn/order/1").ok, true);
+  assert.equal(checkObservedTarget(p, "rehearsal", "https://example.com/phish").ok, false);
 });
 
 test("mac runner defaults to Chrome and a dedicated TicketAgent profile", () => {
@@ -346,6 +448,97 @@ test("a live official queue is polled serially without navigation or refresh", a
   assertResultConsistent(result);
 });
 
+test("an adapter DOM event exits the queue without fixed-delay sleep or refresh", async () => {
+  const adapter = new EventDrivenFakeDamaiAdapter();
+  adapter.currentSignals = signals({ inOfficialQueue: true });
+  let queueInspects = 0;
+  adapter.onInspect = (_context, phase) => {
+    if (phase === "queue") queueInspects += 1;
+  };
+  const page = eventDrivenFakePage(() => {
+    adapter.currentSignals = signals({ inOfficialQueue: false });
+    return {
+      outcome: "matched",
+      key: "visible-state-change",
+      visibility: "visible",
+      source: "mutation"
+    };
+  });
+  let fixedSleeps = 0;
+  const result = await new LocalRunner({
+    page,
+    adapter,
+    sleep: () => { fixedSleeps += 1; }
+  }).run({
+    runId: "run-event-driven-queue",
+    plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+    mode: "live"
+  });
+
+  assert.equal(page.evaluateCount, 1);
+  assert.equal(fixedSleeps, 0);
+  assert.equal(queueInspects, 2);
+  assert.equal(adapter.navigateCount, 1, "event-driven waiting must not navigate or refresh");
+  assert.equal(result.state, "REVIEW_REQUIRED");
+  assertResultConsistent(result);
+});
+
+test("an uncorroborated adapter DOM event fails closed instead of spinning", async () => {
+  const adapter = new EventDrivenFakeDamaiAdapter();
+  adapter.currentSignals = signals({ inOfficialQueue: true });
+  const page = eventDrivenFakePage(() => ({
+    outcome: "matched",
+    key: "visible-state-change",
+    visibility: "visible",
+    source: "mutation"
+  }));
+  const result = await new LocalRunner({ page, adapter }).run({
+    runId: "run-uncorroborated-dom-event",
+    plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+    mode: "live"
+  });
+
+  assert.equal(page.evaluateCount, 1);
+  assert.equal(result.state, "PAGE_CHANGED");
+  assert.match(result.message, /DOM_EVENT_UNCORROBORATED:visible-state-change/);
+  assert.equal(adapter.actionCount, 0);
+  assertResultConsistent(result);
+});
+
+test("event-driven sale deadline avoids repeated pre-sale DOM inspection", async () => {
+  const adapter = new EventDrivenFakeDamaiAdapter();
+  const saleAt = Date.parse("2026-07-30T00:00:05.000Z");
+  let nowMs = Date.parse("2026-07-30T00:00:00.000Z");
+  let prewarmInspects = 0;
+  adapter.onInspect = (_context, phase) => {
+    if (phase === "prewarm") prewarmInspects += 1;
+  };
+  const page = eventDrivenFakePage(() => {
+    nowMs = saleAt;
+    return { outcome: "timeout", source: "timeout" };
+  });
+  let fixedSleeps = 0;
+  const result = await new LocalRunner({
+    page,
+    adapter,
+    now: () => new Date(nowMs),
+    sleep: () => { fixedSleeps += 1; }
+  }).run({
+    runId: "run-event-driven-sale-deadline",
+    plan: plan({
+      officialUrl: "https://detail.damai.cn/item.htm?id=123",
+      saleAt: new Date(saleAt).toISOString()
+    }),
+    mode: "live"
+  });
+
+  assert.equal(page.evaluateCount, 1);
+  assert.equal(fixedSleeps, 0);
+  assert.equal(prewarmInspects, 1, "deadline timeout must not trigger 2-second full-page scans");
+  assert.equal(result.state, "REVIEW_REQUIRED");
+  assertResultConsistent(result);
+});
+
 test("controller-side cancellation stops an otherwise permanent queue", async () => {
   const adapter = new FakeDamaiAdapter();
   adapter.currentSignals = signals({ inOfficialQueue: true });
@@ -452,6 +645,61 @@ test("LocalRunner itself rejects a live adapter that has not been reviewed", asy
   assert.equal(result.state, "FAILED");
   assert.match(result.message, /LIVE_ADAPTER_NOT_READY/);
   assert.equal(adapter.navigateCount, 0);
+  assertResultConsistent(result);
+});
+
+test("rehearsal permits visible selections with liveReady false but has zero authorization and submit capability", async () => {
+  const adapter = new FakeDamaiAdapter(false);
+  let authorizeCount = 0;
+  const result = await new LocalRunner({
+    page: fakePage(),
+    adapter,
+    authorizeSubmit: (input) => {
+      authorizeCount += 1;
+      return { allowed: true, approvedTotalFen: input.observedTotalFen };
+    }
+  }).run({
+    runId: "run-rehearsal-no-submit",
+    plan: autoLivePlan(),
+    mode: "rehearsal"
+  });
+
+  assert.equal(result.state, "REVIEW_REQUIRED");
+  assert.match(result.message, /Rehearsal complete/);
+  assert.equal(adapter.navigateCount, 1);
+  assert.equal(adapter.actionCount, 4);
+  assert.equal(authorizeCount, 0, "rehearsal must never call the controller authorization hook");
+  assert.equal(adapter.submitCount, 0, "rehearsal must never call adapter.submitOrder");
+  assert.equal(result.events.some((event) => event.state === "SUBMIT_ORDER"), false);
+  assert.equal(result.events.some((event) => event.state === "PAY_REQUIRED"), false);
+  assertResultConsistent(result);
+});
+
+test("rehearsal fails closed on a cross-origin redirect before authorization or submit", async () => {
+  const adapter = new FakeDamaiAdapter(false);
+  let authorizeCount = 0;
+  adapter.onAction = (context, phase) => {
+    if (phase === "session") (context.page as MutableFakePage).setUrl("https://example.com/phish");
+  };
+  const result = await new LocalRunner({
+    page: fakePage(),
+    adapter,
+    authorizeSubmit: (input) => {
+      authorizeCount += 1;
+      return { allowed: true, approvedTotalFen: input.observedTotalFen };
+    }
+  }).run({
+    runId: "run-rehearsal-redirect",
+    plan: autoLivePlan(),
+    mode: "rehearsal"
+  });
+
+  assert.equal(result.state, "PAGE_CHANGED");
+  assert.match(result.message, /TARGET_BLOCKED/);
+  assert.equal(adapter.actionCount, 1);
+  assert.equal(authorizeCount, 0);
+  assert.equal(adapter.submitCount, 0);
+  assert.equal(result.events.some((event) => event.state === "SUBMIT_ORDER"), false);
   assertResultConsistent(result);
 });
 

@@ -12,6 +12,18 @@ export type AdapterPhase =
   | "verify"
   | "submit";
 
+export type AdapterDomWaitPhase = "sale" | "queue";
+
+/**
+ * A visible-DOM-only wake condition. Keys are fixed non-sensitive labels;
+ * selectors must never encode attendee or account data.
+ */
+export interface AdapterDomPredicate {
+  key: string;
+  selector: string;
+  visibility?: "visible" | "hidden";
+}
+
 export type PriceObservation =
   | { kind: "missing"; valuesFen: [] }
   | { kind: "unique"; valuesFen: [number]; totalFen: number }
@@ -102,6 +114,8 @@ export interface TicketPlatformAdapter {
   navigate(page: Page, url: string): Promise<void>;
   inspect(context: AdapterContext, phase: AdapterPhase): Promise<PageSignals>;
   guard(signals: PageSignals, phase: AdapterPhase, plan: WatchPlan): GuardDecision;
+  /** Optional event-driven wake conditions; absence preserves serial fallback polling. */
+  domWaitPredicates?(phase: AdapterDomWaitPhase): readonly AdapterDomPredicate[];
 
   selectSession(context: AdapterContext): Promise<AdapterStepResult>;
   selectTier(context: AdapterContext): Promise<AdapterStepResult>;

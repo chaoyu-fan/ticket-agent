@@ -124,6 +124,7 @@ test("loadRunPlan binds both responses to the requested run and plan", async () 
     sessions: [],
     tiers: [],
     priceStrategy: "CHEAPEST_FIRST",
+    attendeeRefs: [],
     attendeeAliases: [],
     autoSubmitOrder: false,
     status: "ARMED",
@@ -137,6 +138,19 @@ test("loadRunPlan binds both responses to the requested run and plan", async () 
     );
     const client = new ControllerClient("http://127.0.0.1:4317", token);
     assert.deepEqual(await client.loadRunPlan("run-1"), { run, plan });
+
+    const unsafe = "LOCAL_DISPLAY_VALUE";
+    globalThis.fetch = async (input) => new Response(
+      JSON.stringify(String(input).includes("/runs/") ? { run } : { plan: { ...plan, attendeeAliases: [unsafe] } }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+    await assert.rejects(
+      () => client.loadRunPlan("run-1"),
+      (error: unknown) =>
+        error instanceof ControllerClientError &&
+        error.code === "CONTROLLER_RESPONSE_INVALID" &&
+        !error.message.includes(unsafe)
+    );
 
     globalThis.fetch = async () => new Response(
       JSON.stringify({ run: { ...run, id: "run-other" } }),

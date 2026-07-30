@@ -9,8 +9,13 @@
 - 已取得并验证一个低热度大麦官方活动链接，专用只读计划位于
   `examples/damai-iwwf-readonly-plan.json`；真实页面 selector 和确认页尚未审核，
   因此 `liveReady` 继续固定为 `false`。
+- 开售/官方队列等待已改为页面内 `MutationObserver` 主触发；浏览器驻留选择状态机和 T-10
+  一次性提交能力原语也已具备独立测试，但二者尚未接入大麦 live。隔离性能基准只表示本机理想下限，
+  不能当作真实端到端购票延迟或成功率。
 - 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。
-- 当前默认值为 1 张、可见允许票档中最低价优先；未设置 `maxTotalFen` 时禁止自动提交。
+- 当前默认值为 1 张、可见允许票档中最低价优先；热门活动的极速配置应改用
+  `PREFERRED_ORDER`，按用户预先批准的票档顺序命中即走。未设置 `maxTotalFen` 时禁止自动提交。
+  自动提交还必须绑定带时区的 `saleAt`；该时间会成为一次性能力的签名最早提交门。
 
 账号会话和 Chrome profile 只留在用户 Mac。本项目不保存或上传密码、Cookie、身份证号和支付信息。
 
@@ -23,6 +28,8 @@ npm ci
 npm run check
 npm test
 npm run smoke
+npm run --silent benchmark:loopback
+npm run --silent benchmark:state-machine
 ```
 
 没有活动链接时，可以进行纯配置检查；它不会启动浏览器或访问网络：
@@ -51,7 +58,7 @@ npm run start:runner -- --dry-run \
 bash scripts/setup-macos.sh
 ```
 
-真实模式和 mock/dry-run 使用两个隔离的 Chrome profile。目录拒绝符号链接、权限限制为 `0700`，并通过原子锁阻止同一 profile 同时运行两个执行器。live 模式强制显示浏览器，以便验证码、登录或支付时人工接管。
+真实 live/rehearsal 模式和 mock/dry-run 使用两个隔离的 Chrome profile。目录拒绝符号链接、权限限制为 `0700`，并通过原子锁阻止同一 profile 同时运行两个执行器。live 与 rehearsal 都强制显示浏览器，以便验证码或登录时人工接管；rehearsal 在代码层面没有控制器授权和订单提交能力。
 
 本机控制器只监听 loopback，令牌至少 32 字节：
 
@@ -67,4 +74,4 @@ npm run start:controller
 
 ## 重要边界
 
-本项目不实现验证码破解、私有接口逆向、代理池、多账号并发、设备指纹伪造或绕过平台限购。成功率由库存和官方队列决定；工程目标是预算不越界、不重复提交、状态可审计并且随时能够人工接管。
+本项目不实现验证码破解、私有接口逆向、代理池、多账号并发、设备指纹伪造或绕过平台限购。成功率由库存和官方队列决定；“极速”仅指压低 Mac 本地可控延迟，工程目标仍包括预算不越界、不重复提交、状态可审计并且随时能够人工接管。

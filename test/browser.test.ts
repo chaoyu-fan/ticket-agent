@@ -90,4 +90,9 @@ test("CLI blocks live mode until an adapter is explicitly live-ready", () => {
   assert.throws(() => assertLiveAdapterReady("live", { platform: "maoyan" }), /LIVE_ADAPTER_NOT_READY:maoyan/);
   assert.doesNotThrow(() => assertLiveAdapterReady("mock", { platform: "damai" }));
   assert.doesNotThrow(() => assertLiveAdapterReady("dry-run", { platform: "damai" }));
+  assert.doesNotThrow(() => assertLiveAdapterReady("rehearsal", { platform: "damai" }));
+  assert.throws(
+    () => assertLiveAdapterReady("rehearsal", { platform: "maoyan" }),
+    /REHEARSAL_ADAPTER_NOT_READY:maoyan/
+  );
 });

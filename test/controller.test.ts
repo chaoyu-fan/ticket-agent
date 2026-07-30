@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,6 +9,9 @@ import type { RunnerEvent, RunState, WatchPlanInput } from "../src/core/types.js
 import { closeController, createControllerHttpServer, listenController } from "../src/controller/http.js";
 import { ControllerError } from "../src/controller/errors.js";
 import { ControllerStore, eventKeyForPlan } from "../src/controller/store.js";
+
+const ATTENDEE_REF_A = "attendee:v1:550e8400-e29b-41d4-a716-446655440000" as const;
+const ATTENDEE_REF_B = "attendee:v1:d9428888-122b-4c26-9f8b-6f2f1175e1f4" as const;
 
 function memoryStore(): ControllerStore {
   let nextId = 0;
@@ -26,9 +29,10 @@ function safePlan(overrides: Partial<WatchPlanInput> = {}): WatchPlanInput {
     eventId: "123",
     eventTitle: "测试演唱会 上海站",
     canonicalEventKey: "test-show-2026-shanghai",
+    saleAt: "2026-08-01T10:00:00+08:00",
     quantity: 1,
     maxTotalFen: 88_000,
-    attendeeAliases: ["本人"],
+    attendeeRefs: [ATTENDEE_REF_A],
     autoSubmitOrder: true,
     ...overrides
   };
@@ -89,16 +93,45 @@ test("plan CRUD applies safe defaults and only drafts are editable/deletable", (
       eventTitle: null,
       canonicalEventKey: "show-2026-shanghai-v2",
       quantity: 2,
-      attendeeAliases: ["甲", "乙"]
+      attendeeRefs: [ATTENDEE_REF_A, ATTENDEE_REF_B]
     });
     assert.equal(updated.eventTitle, undefined);
     assert.equal(updated.canonicalEventKey, "show-2026-shanghai-v2");
     assert.equal(updated.quantity, 2);
+    assert.deepEqual(updated.attendeeRefs, [ATTENDEE_REF_A, ATTENDEE_REF_B]);
+    assert.deepEqual(updated.attendeeAliases, []);
     assert.equal(store.listPlans().length, 1);
 
     store.deletePlan(plan.id);
     assert.equal(store.getPlan(plan.id), undefined);
     assert.equal(store.listPlans().length, 0);
+  } finally {
+    store.close();
+  }
+});
+
+test("controller persistence accepts only opaque refs and never writes resolved labels", () => {
+  const store = memoryStore();
+  const unsafe = "LOCAL_DISPLAY_VALUE";
+  try {
+    let thrown: unknown;
+    try {
+      store.createPlan({ platform: "damai", attendeeAliases: [unsafe] });
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof ControllerError);
+    assert.equal(thrown.code, "PLAN_INVALID");
+    assert.equal(JSON.stringify(thrown).includes(unsafe), false);
+
+    const plan = store.createPlan({ platform: "damai", attendeeRefs: [ATTENDEE_REF_A] });
+    const row = store.database.prepare(`
+      SELECT attendee_refs_json, attendee_aliases_json FROM watch_plans WHERE id = ?
+    `).get(plan.id) as { attendee_refs_json: string; attendee_aliases_json: string };
+    assert.equal(row.attendee_refs_json, JSON.stringify([ATTENDEE_REF_A]));
+    assert.equal(row.attendee_aliases_json, "[]");
+    assert.deepEqual(store.requirePlan(plan.id).attendeeRefs, [ATTENDEE_REF_A]);
+    assert.deepEqual(store.requirePlan(plan.id).attendeeAliases, []);
   } finally {
     store.close();
   }
@@ -476,6 +509,14 @@ test("legacy databases migrate additively and database files stay owner-only", (
         observed_total_fen INTEGER, selected_session TEXT, selected_tier TEXT, order_reference TEXT,
         last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE purchase_locks (
+        event_key TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES purchase_runs(id) ON DELETE RESTRICT,
+        plan_id TEXT NOT NULL REFERENCES watch_plans(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL CHECK(status IN ('HELD', 'PURCHASED')),
+        acquired_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       INSERT INTO watch_plans VALUES (
         'legacy-plan', 'damai', 'https://www.damai.cn/item/legacy', NULL, '旧活动', NULL,
         1, 0, '[]', '[]', 88000, 'CHEAPEST_FIRST', '["本人"]', 1, 'RUNNING',
@@ -484,6 +525,10 @@ test("legacy databases migrate additively and database files stay owner-only", (
       INSERT INTO purchase_runs VALUES (
         'legacy-run', 'legacy-plan', 'VERIFY_PRICE', 68000, '首场', '最低价', NULL, NULL,
         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:02.000Z'
+      );
+      INSERT INTO purchase_locks VALUES (
+        'canonical:legacy-show', 'legacy-run', 'legacy-plan', 'HELD',
+        '2026-01-01T00:00:02.000Z', '2026-01-01T00:00:02.000Z'
       );
     `);
     legacy.close();
@@ -497,13 +542,39 @@ test("legacy databases migrate additively and database files stay owner-only", (
       const runColumns = store.database.prepare("PRAGMA table_info(purchase_runs)").all() as Array<{ name: string }>;
       assert.ok(planColumns.some((column) => column.name === "canonical_event_key"));
       assert.ok(planColumns.some((column) => column.name === "event_key"));
+      assert.ok(planColumns.some((column) => column.name === "attendee_refs_json"));
       assert.ok(runColumns.some((column) => column.name === "price_verified_at"));
-      assert.equal(store.requireRun("legacy-run").priceVerifiedAt, "2026-01-01T00:00:02.000Z");
+      const migratedRun = store.requireRun("legacy-run");
+      assert.equal(migratedRun.state, "FAILED");
+      assert.equal(migratedRun.lastError, "ATTENDEE_IDENTITY_MIGRATION_REQUIRED");
+      assert.equal(migratedRun.priceVerifiedAt, "2026-01-01T00:00:02.000Z");
+      assert.equal(store.getRunAudit("legacy-run").at(-1)?.fromState, "VERIFY_PRICE");
+      assert.equal(store.getRunAudit("legacy-run").at(-1)?.toState, "FAILED");
+      assert.equal(
+        store.getRunAudit("legacy-run").at(-1)?.message,
+        "ATTENDEE_IDENTITY_MIGRATION_REQUIRED"
+      );
+      assert.equal(store.getPurchaseLockForRun("legacy-run")?.status, "HELD");
+      const migrated = store.requirePlan("legacy-plan");
+      assert.equal(migrated.status, "PAUSED");
+      assert.equal(migrated.autoSubmitOrder, false);
+      assert.deepEqual(migrated.attendeeRefs, []);
+      assert.deepEqual(migrated.attendeeAliases, []);
+      const rawIdentity = store.database.prepare(`
+        SELECT attendee_refs_json, attendee_aliases_json FROM watch_plans WHERE id = 'legacy-plan'
+      `).get() as { attendee_refs_json: string; attendee_aliases_json: string };
+      assert.equal(rawIdentity.attendee_refs_json, "[]");
+      assert.equal(rawIdentity.attendee_aliases_json, "[]");
+      assert.equal(
+        store.getPlanAudit("legacy-plan").at(-1)?.reason,
+        "ATTENDEE_IDENTITY_MIGRATION_REQUIRED"
+      );
       assert.equal(statSync(databasePath).mode & 0o777, 0o600);
     } finally {
       store.close();
     }
     assert.equal(statSync(databasePath).mode & 0o777, 0o600);
+    assert.equal(readFileSync(databasePath).includes(Buffer.from("本人", "utf8")), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -520,6 +591,21 @@ test("database paths reject symbolic links before SQLite opens them", () => {
     assert.throws(() => new ControllerStore(linkPath), /DATABASE_PATH_UNSAFE/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("arming rejects a paused plan while any prior run remains non-terminal", () => {
+  const store = memoryStore();
+  try {
+    const { plan, run } = store.armPlan(store.createPlan(safePlan({ autoSubmitOrder: false })).id);
+    store.database.prepare("UPDATE watch_plans SET status = 'PAUSED' WHERE id = ?").run(plan.id);
+
+    assert.throws(() => store.armPlan(plan.id), assertControllerCode("PLAN_ACTIVE_RUN_EXISTS"));
+    assert.equal(store.requirePlan(plan.id).status, "PAUSED");
+    assert.deepEqual(store.listRuns(plan.id).map((item) => item.id), [run.id]);
+    assert.equal(store.requireRun(run.id).state, "SCHEDULED");
+  } finally {
+    store.close();
   }
 });
 

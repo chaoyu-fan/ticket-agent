@@ -4,7 +4,7 @@ import type { RunnerEvent, WatchPlan } from "../core/types.js";
 import type { TicketPlatformAdapter } from "../adapters/types.js";
 
 /** A mode is deliberately required; there is no implicit live mode. */
-export type RunnerMode = "dry-run" | "mock" | "live";
+export type RunnerMode = "dry-run" | "mock" | "rehearsal" | "live";
 
 export interface LocalRunnerRequest {
   runId: string;

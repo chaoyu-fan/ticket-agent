@@ -1,5 +1,6 @@
 import type { PurchaseRun, RunnerEvent, WatchPlan } from "../core/types.js";
 import { validatePlan } from "../core/policy.js";
+import { assertAttendeePersistenceBoundary } from "../identity/attendee-ref.js";
 
 interface ErrorPayload {
   error?: { code?: string; message?: string; details?: unknown };
@@ -118,6 +119,11 @@ export class ControllerClient {
       throw invalidApproval("Controller plan response must contain a plan object");
     }
     const plan = planPayload.plan;
+    try {
+      assertAttendeePersistenceBoundary(plan);
+    } catch {
+      throw invalidApproval("Controller plan contains forbidden attendee identity material");
+    }
     if (
       plan.id !== run.planId ||
       typeof plan.status !== "string" ||

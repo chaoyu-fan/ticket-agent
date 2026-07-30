@@ -4,6 +4,11 @@ import { DatabaseSync } from "node:sqlite";
 
 import { canAutoSubmit, normalizePlan, validatePlan } from "../core/policy.js";
 import { isTerminal, transition } from "../core/state.js";
+import {
+  assertAttendeePersistenceBoundary,
+  isAttendeeRef,
+  parseAttendeeRefs
+} from "../identity/attendee-ref.js";
 import type {
   PlanStatus,
   Platform,
@@ -31,6 +36,8 @@ export interface WatchPlanPatch {
   tiers?: TierPreference[];
   maxTotalFen?: number | null;
   priceStrategy?: PriceStrategy;
+  attendeeRefs?: string[];
+  /** @deprecated Non-empty aliases are rejected at the persistence boundary. */
   attendeeAliases?: string[];
   autoSubmitOrder?: boolean;
 }
@@ -152,6 +159,8 @@ const ERROR_STATES = new Set<RunState>([
   "FAILED"
 ]);
 
+const ATTENDEE_IDENTITY_MIGRATION_REASON = "ATTENDEE_IDENTITY_MIGRATION_REQUIRED";
+
 const hasOwn = (object: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(object, key);
 
 function column(row: SqlRow, name: string): SqlValue {
@@ -199,7 +208,10 @@ function planFromRow(row: SqlRow): WatchPlan {
     tiers: parseJson<TierPreference[]>(column(row, "tiers_json"), "tiers_json"),
     ...(maxTotalFen === null ? {} : { maxTotalFen: asNumber(maxTotalFen, "max_total_fen") }),
     priceStrategy: String(column(row, "price_strategy")) as PriceStrategy,
-    attendeeAliases: parseJson<string[]>(column(row, "attendee_aliases_json"), "attendee_aliases_json"),
+    attendeeRefs: parseAttendeeRefs(parseJson<unknown>(column(row, "attendee_refs_json"), "attendee_refs_json")),
+    // Legacy column remains as an empty rollback tombstone. Resolved labels
+    // exist only in Mac runner memory and are never reconstructed from SQLite.
+    attendeeAliases: [],
     autoSubmitOrder: asNumber(column(row, "auto_submit_order"), "auto_submit_order") === 1,
     status,
     createdAt: String(column(row, "created_at")),
@@ -361,9 +373,14 @@ function validateInputShape(input: unknown): string[] {
     }
   }
   if (value.tiers !== undefined && !Array.isArray(value.tiers)) errors.push("tiers must be an array");
+  if (value.attendeeRefs !== undefined) {
+    if (!Array.isArray(value.attendeeRefs) || value.attendeeRefs.some((ref) => !isAttendeeRef(ref))) {
+      errors.push("attendeeRefs must contain only canonical opaque references");
+    }
+  }
   if (value.attendeeAliases !== undefined) {
-    if (!Array.isArray(value.attendeeAliases) || value.attendeeAliases.some((alias) => typeof alias !== "string")) {
-      errors.push("attendeeAliases must be an array of strings");
+    if (!Array.isArray(value.attendeeAliases) || value.attendeeAliases.length !== 0) {
+      errors.push("attendeeAliases cannot be persisted; use opaque attendeeRefs");
     }
   }
   return errors;
@@ -372,6 +389,16 @@ function validateInputShape(input: unknown): string[] {
 function normalizeAndValidate(input: WatchPlanInput): ReturnType<typeof normalizePlan> {
   const shapeErrors = validateInputShape(input);
   if (shapeErrors.length > 0) throw new ControllerError("PLAN_INVALID", "Plan validation failed", 422, shapeErrors);
+  try {
+    assertAttendeePersistenceBoundary(input);
+  } catch (error) {
+    throw new ControllerError(
+      "PLAN_INVALID",
+      "Plan attendee persistence boundary failed",
+      422,
+      [error instanceof Error ? error.message : "ATTENDEE_PERSISTENCE_BOUNDARY_FAILED"]
+    );
+  }
 
   let normalized: ReturnType<typeof normalizePlan>;
   try {
@@ -392,7 +419,8 @@ function candidateFromPatch(current: WatchPlan, patch: WatchPlanPatch): WatchPla
     sessions: patch.sessions ?? current.sessions,
     tiers: patch.tiers ?? current.tiers,
     priceStrategy: patch.priceStrategy ?? current.priceStrategy,
-    attendeeAliases: patch.attendeeAliases ?? current.attendeeAliases,
+    attendeeRefs: patch.attendeeRefs ?? current.attendeeRefs ?? [],
+    attendeeAliases: patch.attendeeAliases ?? [],
     autoSubmitOrder: patch.autoSubmitOrder ?? current.autoSubmitOrder
   };
 
@@ -433,6 +461,7 @@ export class ControllerStore {
     this.database.exec(`
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 5000;
+      PRAGMA secure_delete = ON;
       PRAGMA journal_mode = WAL;
 
       CREATE TABLE IF NOT EXISTS watch_plans (
@@ -450,6 +479,7 @@ export class ControllerStore {
         tiers_json TEXT NOT NULL,
         max_total_fen INTEGER,
         price_strategy TEXT NOT NULL,
+        attendee_refs_json TEXT NOT NULL DEFAULT '[]',
         attendee_aliases_json TEXT NOT NULL,
         auto_submit_order INTEGER NOT NULL,
         status TEXT NOT NULL,
@@ -507,7 +537,9 @@ export class ControllerStore {
     // an older release. Additive migrations keep existing plans and audits.
     this.ensureColumn("watch_plans", "canonical_event_key", "TEXT");
     this.ensureColumn("watch_plans", "event_key", "TEXT");
+    this.ensureColumn("watch_plans", "attendee_refs_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("purchase_runs", "price_verified_at", "TEXT");
+    const scrubbedLegacyIdentity = this.scrubUnsafeAttendeePersistence();
     this.database.exec(`
       UPDATE purchase_runs
       SET price_verified_at = updated_at
@@ -520,6 +552,106 @@ export class ControllerStore {
       CREATE INDEX IF NOT EXISTS run_state_audit_run_idx ON run_state_audit(run_id, id);
       CREATE INDEX IF NOT EXISTS plan_status_audit_plan_idx ON plan_status_audit(plan_id, id);
     `);
+    if (scrubbedLegacyIdentity && this.databasePath !== ":memory:") {
+      // Remove legacy alias bytes from both the main database and WAL rather
+      // than merely making them unreachable through the current schema.
+      this.database.exec("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+  }
+
+  private scrubUnsafeAttendeePersistence(): boolean {
+    const rows = this.database.prepare(`
+      SELECT id, status, attendee_refs_json, attendee_aliases_json
+      FROM watch_plans
+    `).all() as SqlRow[];
+    const unsafe: Array<{
+      id: string;
+      oldStatus: string;
+      newStatus: string;
+      safeRefsJson: string;
+      at: string;
+    }> = [];
+
+    for (const row of rows) {
+      const aliasesJson = column(row, "attendee_aliases_json");
+      const refsJson = column(row, "attendee_refs_json");
+      let safeRefsJson = "[]";
+      let refsAreSafe = false;
+      try {
+        const refs = parseAttendeeRefs(parseJson<unknown>(refsJson, "attendee_refs_json"));
+        safeRefsJson = JSON.stringify(refs);
+        refsAreSafe = true;
+      } catch {
+        // Invalid values may themselves contain identity material. Never echo
+        // them; replace the entire field with an empty, fail-closed value.
+      }
+      const aliasesAreEmpty = aliasesJson === "[]";
+      if (aliasesAreEmpty && refsAreSafe) continue;
+
+      const oldStatus = String(column(row, "status"));
+      const newStatus = oldStatus === "ARMED" || oldStatus === "RUNNING" || !PLAN_STATUSES.has(oldStatus as PlanStatus)
+        ? "PAUSED"
+        : oldStatus;
+      unsafe.push({
+        id: String(column(row, "id")),
+        oldStatus,
+        newStatus,
+        safeRefsJson: refsAreSafe ? safeRefsJson : "[]",
+        at: this.now()
+      });
+    }
+    if (unsafe.length === 0) return false;
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const update = this.database.prepare(`
+        UPDATE watch_plans
+        SET attendee_refs_json = ?, attendee_aliases_json = '[]', auto_submit_order = 0,
+            status = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      const audit = this.database.prepare(`
+        INSERT INTO plan_status_audit (plan_id, from_status, to_status, reason, at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const item of unsafe) {
+        const runRows = this.database
+          .prepare("SELECT * FROM purchase_runs WHERE plan_id = ?")
+          .all(item.id) as SqlRow[];
+        for (const row of runRows) {
+          const currentRun = runFromRow(row);
+          if (isTerminal(currentRun.state)) continue;
+          const failedRun: PurchaseRun = {
+            ...currentRun,
+            // Preserve the legacy price-observation time before updated_at is
+            // advanced by this migration. The general backfill below handles
+            // unaffected plans after this transaction commits.
+            ...(currentRun.observedTotalFen !== undefined && currentRun.priceVerifiedAt === undefined
+              ? { priceVerifiedAt: currentRun.updatedAt }
+              : {}),
+            state: "FAILED",
+            lastError: ATTENDEE_IDENTITY_MIGRATION_REASON,
+            updatedAt: item.at
+          };
+          this.persistRun(failedRun);
+          this.insertRunAudit(
+            failedRun.id,
+            currentRun.state,
+            "FAILED",
+            ATTENDEE_IDENTITY_MIGRATION_REASON,
+            failedRun,
+            item.at
+          );
+        }
+        update.run(item.safeRefsJson, item.newStatus, item.at, item.id);
+        audit.run(item.id, item.oldStatus, item.newStatus, ATTENDEE_IDENTITY_MIGRATION_REASON, item.at);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return true;
   }
 
   private ensureColumn(table: "watch_plans" | "purchase_runs", name: string, declaration: string): void {
@@ -573,9 +705,9 @@ export class ControllerStore {
           INSERT INTO watch_plans (
             id, platform, official_url, event_id, event_title, canonical_event_key, event_key, sale_at,
             quantity, require_adjacent, sessions_json, tiers_json, max_total_fen,
-            price_strategy, attendee_aliases_json, auto_submit_order, status,
+            price_strategy, attendee_refs_json, attendee_aliases_json, auto_submit_order, status,
             created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           plan.id,
@@ -592,7 +724,8 @@ export class ControllerStore {
           JSON.stringify(plan.tiers),
           plan.maxTotalFen ?? null,
           plan.priceStrategy,
-          JSON.stringify(plan.attendeeAliases),
+          JSON.stringify(plan.attendeeRefs ?? []),
+          "[]",
           plan.autoSubmitOrder ? 1 : 0,
           plan.status,
           plan.createdAt,
@@ -642,7 +775,7 @@ export class ControllerStore {
           UPDATE watch_plans SET
             platform = ?, official_url = ?, event_id = ?, event_title = ?, canonical_event_key = ?, event_key = ?, sale_at = ?,
             quantity = ?, require_adjacent = ?, sessions_json = ?, tiers_json = ?, max_total_fen = ?,
-            price_strategy = ?, attendee_aliases_json = ?, auto_submit_order = ?, updated_at = ?
+            price_strategy = ?, attendee_refs_json = ?, attendee_aliases_json = '[]', auto_submit_order = ?, updated_at = ?
           WHERE id = ?
         `)
         .run(
@@ -659,7 +792,7 @@ export class ControllerStore {
           JSON.stringify(updated.tiers),
           updated.maxTotalFen ?? null,
           updated.priceStrategy,
-          JSON.stringify(updated.attendeeAliases),
+          JSON.stringify(updated.attendeeRefs ?? []),
           updated.autoSubmitOrder ? 1 : 0,
           updated.updatedAt,
           updated.id
@@ -684,6 +817,13 @@ export class ControllerStore {
       const current = this.requirePlan(id);
       if (current.status !== "DRAFT" && current.status !== "PAUSED") {
         throw new ControllerError("PLAN_NOT_ARMABLE", `Cannot arm a ${current.status} plan`, 409);
+      }
+      if (this.hasNonTerminalRun(current.id)) {
+        throw new ControllerError(
+          "PLAN_ACTIVE_RUN_EXISTS",
+          "A non-terminal purchase run already exists for this plan; reconcile it before re-arming",
+          409
+        );
       }
       const validation = validatePlan(current);
       if (!validation.ok) throw new ControllerError("PLAN_INVALID", "Plan validation failed", 422, validation.errors);
@@ -781,6 +921,16 @@ export class ControllerStore {
       .prepare("SELECT * FROM purchase_runs WHERE plan_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
       .get(planId) as SqlRow | undefined;
     return row === undefined ? undefined : runFromRow(row);
+  }
+
+  private hasNonTerminalRun(planId: string): boolean {
+    const rows = this.database
+      .prepare("SELECT state FROM purchase_runs WHERE plan_id = ?")
+      .all(planId) as SqlRow[];
+    return rows.some((row) => {
+      const state = String(column(row, "state"));
+      return !RUN_STATES.has(state as RunState) || !isTerminal(state as RunState);
+    });
   }
 
   applyRunnerEvent(event: RunnerEvent): PurchaseRun {

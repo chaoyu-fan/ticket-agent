@@ -2,6 +2,70 @@ import type { Platform, WatchPlan } from "../core/types.js";
 
 import type { RunnerMode } from "./types.js";
 
+export interface RunnerSafetyPolicy {
+  readonly targetScope: "loopback" | "official" | "official-or-loopback";
+  readonly profileScope: "live" | "sandbox";
+  readonly allowSelection: boolean;
+  readonly allowOfficialQueueWait: boolean;
+  readonly allowController: boolean;
+  readonly allowSubmitAuthorization: boolean;
+  readonly allowSubmitOrder: boolean;
+  readonly requireLiveReady: boolean;
+}
+
+function immutablePolicy(policy: RunnerSafetyPolicy): RunnerSafetyPolicy {
+  return Object.freeze(policy);
+}
+
+const RUNNER_SAFETY_POLICIES: Readonly<Record<RunnerMode, RunnerSafetyPolicy>> = Object.freeze({
+  "dry-run": immutablePolicy({
+    targetScope: "official-or-loopback",
+    profileScope: "sandbox",
+    allowSelection: false,
+    allowOfficialQueueWait: false,
+    allowController: false,
+    allowSubmitAuthorization: false,
+    allowSubmitOrder: false,
+    requireLiveReady: false
+  }),
+  mock: immutablePolicy({
+    targetScope: "loopback",
+    profileScope: "sandbox",
+    allowSelection: true,
+    allowOfficialQueueWait: false,
+    allowController: false,
+    allowSubmitAuthorization: false,
+    allowSubmitOrder: false,
+    requireLiveReady: false
+  }),
+  rehearsal: immutablePolicy({
+    targetScope: "official",
+    profileScope: "live",
+    allowSelection: true,
+    allowOfficialQueueWait: true,
+    allowController: false,
+    allowSubmitAuthorization: false,
+    allowSubmitOrder: false,
+    requireLiveReady: false
+  }),
+  live: immutablePolicy({
+    targetScope: "official",
+    profileScope: "live",
+    allowSelection: true,
+    allowOfficialQueueWait: true,
+    allowController: true,
+    allowSubmitAuthorization: true,
+    allowSubmitOrder: true,
+    requireLiveReady: true
+  })
+});
+
+export function runnerSafetyPolicy(mode: RunnerMode): RunnerSafetyPolicy {
+  const policy = RUNNER_SAFETY_POLICIES[mode];
+  if (!policy) throw new Error("RUNNER_MODE_INVALID");
+  return policy;
+}
+
 export interface TargetCheck {
   ok: boolean;
   message: string;
@@ -24,8 +88,11 @@ export function isOfficialUrl(platform: Platform, url: URL): boolean {
 }
 
 export function checkRunTarget(plan: WatchPlan, mode: RunnerMode, targetUrl: string | undefined): TargetCheck {
-  if (mode !== "dry-run" && mode !== "mock" && mode !== "live") {
-    return { ok: false, message: "Runner mode must be explicitly dry-run, mock, or live" };
+  let policy: RunnerSafetyPolicy;
+  try {
+    policy = runnerSafetyPolicy(mode);
+  } catch {
+    return { ok: false, message: "Runner mode must be explicitly dry-run, mock, rehearsal, or live" };
   }
   if (!targetUrl) {
     if (mode === "dry-run") return { ok: true, message: "No target supplied; dry-run remains read-only" };
@@ -42,21 +109,21 @@ export function checkRunTarget(plan: WatchPlan, mode: RunnerMode, targetUrl: str
 
   const loopbackHttp = (parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopback(parsed);
   const official = isOfficialUrl(plan.platform, parsed);
-  if (mode === "mock") {
+  if (policy.targetScope === "loopback") {
     if (!loopbackHttp) {
       return { ok: false, message: "Mock mode only permits localhost/loopback HTTP(S) targets" };
     }
-  } else if (mode === "live" && !official) {
+  } else if (policy.targetScope === "official" && !official) {
     return {
       ok: false,
       message: `Only an HTTPS official ${plan.platform} URL is permitted outside mock mode`
     };
-  } else if (mode === "dry-run" && !official && !loopbackHttp) {
+  } else if (!official && !loopbackHttp) {
     return { ok: false, message: "Dry-run permits only an official platform URL or a loopback mock target" };
   }
 
-  if (mode === "live" && plan.officialUrl && parsed.href !== new URL(plan.officialUrl).href) {
-    return { ok: false, message: "Live target must exactly match plan.officialUrl" };
+  if (policy.targetScope === "official" && plan.officialUrl && parsed.href !== new URL(plan.officialUrl).href) {
+    return { ok: false, message: `${mode} target must exactly match plan.officialUrl` };
   }
   return { ok: true, message: "Target accepted", url: parsed };
 }
@@ -77,8 +144,19 @@ export function checkObservedTarget(plan: WatchPlan, mode: RunnerMode, observedU
   if (parsed.username || parsed.password) return { ok: false, message: "Observed page URL contains credentials" };
   const loopbackHttp = (parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopback(parsed);
   const official = isOfficialUrl(plan.platform, parsed);
-  if (mode === "mock" && !loopbackHttp) return { ok: false, message: "Mock page redirected away from loopback" };
-  if (mode !== "mock" && !official && !(mode === "dry-run" && loopbackHttp)) {
+  let policy: RunnerSafetyPolicy;
+  try {
+    policy = runnerSafetyPolicy(mode);
+  } catch {
+    return { ok: false, message: "Runner mode is invalid" };
+  }
+  if (policy.targetScope === "loopback" && !loopbackHttp) {
+    return { ok: false, message: "Mock page redirected away from loopback" };
+  }
+  if (policy.targetScope === "official" && !official) {
+    return { ok: false, message: `Observed page left the official ${plan.platform} host` };
+  }
+  if (policy.targetScope === "official-or-loopback" && !official && !loopbackHttp) {
     return { ok: false, message: `Observed page left the official ${plan.platform} host` };
   }
   return { ok: true, message: "Observed page URL accepted", url: parsed };
