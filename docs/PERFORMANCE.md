@@ -60,3 +60,24 @@ CSP，以及无表单的固定 `type=button` sink。脚本不接受 URL、样本
 状态机 callback 的本机下限，不能代表大麦真实提交控件、可信输入事件、页面跳转、订单网络响应、
 库存、队列或风控。是否需要可信输入桥接只能在 Mac 无提交 rehearsal 中另行校准；该基准本身不能
 解除 `liveReady=false`。
+
+## 可信 ElementHandle 点击的隔离基准
+
+最终不可逆操作不能把上面的合成点击当作可信用户输入。下面的独立命令测量 Playwright 对一个精确
+`ElementHandle` 执行非 `force` actionability click 的本机往返，并要求 Chrome 产生的 click 事件满足
+`event.isTrusted === true`：
+
+```bash
+npm run --silent benchmark:trusted-click > trusted-click-performance.json
+```
+
+它固定预热 50 次并采样 500 次。每轮必须恰好收到一个可信 click、零个不可信 click；严格 JSON 的
+`trustedElementHandleClickMs` 汇总包含 nearest-rank `p50Ms`、`p95Ms` 和 `p99Ms`。命令还会先执行三个
+fail-closed 门：精确 handle 已脱离、目标被 overlay 遮挡、目标被 disabled 时，点击必须被拒绝，原节点、
+替换节点、遮罩和 disabled 节点都必须保持零 click。性能门固定为 p95 不超过 75 ms、p99 不超过
+100 ms。
+
+基准只访问随机端口 `127.0.0.1` 上的无表单 fixture，使用临时无登录 context；CLI 不接受 URL、profile
+或采样数参数，浏览器层和 CSP 都禁止外部网络。`force: false`、`noWaitAfter: true`、`scroll: "none"`
+保持固定，也不会回退到坐标、`HTMLElement.click()` 或重新查询替换节点。它证明的是可信点击原语及
+故障门，不包含生产状态机到 submit handle 的证据交接，也不能解除 `liveReady=false`。

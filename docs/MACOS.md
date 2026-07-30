@@ -20,12 +20,16 @@ npm run --silent benchmark:loopback > loopback-performance-3.json
 npm run --silent benchmark:state-machine > state-machine-performance-1.json
 npm run --silent benchmark:state-machine > state-machine-performance-2.json
 npm run --silent benchmark:state-machine > state-machine-performance-3.json
+npm run --silent benchmark:trusted-click > trusted-click-performance-1.json
+npm run --silent benchmark:trusted-click > trusted-click-performance-2.json
+npm run --silent benchmark:trusted-click > trusted-click-performance-3.json
 ```
 
-前三轮是 benchmark-only 的 DOM/假点击下限；后三轮实际调用驻留状态机，覆盖 DOM mutation、场次、
-票档、数量、合成观演人选择、总价复核和固定假 sink。两者都只使用临时无登录 Chrome；假点击为
-`isTrusted=false`，不包含大麦真实选择器、可信输入、网络、队列、风控或订单响应，不能据此宣称
-真实购票达到相同延迟或解除 `liveReady=false`。
+前三轮是 benchmark-only 的 DOM/假点击下限；中间三轮实际调用驻留状态机，覆盖 DOM mutation、场次、
+票档、数量、合成观演人选择、总价复核和固定假 sink；最后三轮测量精确 ElementHandle 的非 force
+可信点击，并验证脱离、遮挡和 disabled 时零点击。三种基准都只使用临时无登录 Chrome。前两种的
+假点击为 `isTrusted=false`；第三种要求 `isTrusted=true`，但仍没有大麦真实选择器、状态机证据交接、
+网络、队列、风控或订单响应，不能据此宣称真实购票达到相同延迟或解除 `liveReady=false`。
 
 不要把日常 Chrome 的目录、其父目录或 `Default` profile 配给执行器；live 与 sandbox profile 也不能相同或互为父子目录。首次使用 live 专用 profile 时，账号登录、实名观演人维护和安全验证都由用户在可见浏览器中完成。
 

@@ -17,6 +17,7 @@
     "smoke": "npm run build && node scripts/smoke-mock.mjs",
     "benchmark:loopback": "tsc -p tsconfig.json && node scripts/benchmark-loopback.mjs",
     "benchmark:state-machine": "tsc -p tsconfig.json && node scripts/benchmark-state-machine.mjs",
+    "benchmark:trusted-click": "tsc -p tsconfig.json && node scripts/benchmark-trusted-click.mjs",
     "check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

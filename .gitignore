@@ -27,6 +27,9 @@ npm-debug.log*
 *.log
 playwright-report/
 test-results/
+loopback-performance*.json
+state-machine-performance*.json
+trusted-click-performance*.json
 trace/
 traces/
 screenshots/

@@ -10,8 +10,9 @@
   `examples/damai-iwwf-readonly-plan.json`；真实页面 selector 和确认页尚未审核，
   因此 `liveReady` 继续固定为 `false`。
 - 开售/官方队列等待已改为页面内 `MutationObserver` 主触发；浏览器驻留选择状态机和 T-10
-  一次性提交能力原语也已具备独立测试，但二者尚未接入大麦 live。隔离性能基准只表示本机理想下限，
-  不能当作真实端到端购票延迟或成功率。
+  一次性提交能力原语也已具备独立测试；精确 ElementHandle 的可信点击及脱离/遮挡/disabled
+  fail-closed 基准已经加入，但这些模块尚未接入大麦 live。隔离性能基准只表示本机理想下限，不能
+  当作真实端到端购票延迟或成功率。
 - 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。
 - 当前默认值为 1 张、可见允许票档中最低价优先；热门活动的极速配置应改用
   `PREFERRED_ORDER`，按用户预先批准的票档顺序命中即走。未设置 `maxTotalFen` 时禁止自动提交。
@@ -30,6 +31,7 @@ npm test
 npm run smoke
 npm run --silent benchmark:loopback
 npm run --silent benchmark:state-machine
+npm run --silent benchmark:trusted-click
 ```
 
 没有活动链接时，可以进行纯配置检查；它不会启动浏览器或访问网络：

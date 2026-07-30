@@ -19,6 +19,7 @@ import type { Page } from "playwright-core";
 // One foreground-frame fallback keeps the missed-mutation path responsive;
 // MutationObserver remains the normal zero-polling trigger.
 export const DEFAULT_SELECTION_FALLBACK_INTERVAL_MS = 16;
+export const MAX_SELECTION_RESIDENCY_MS = 30 * 60 * 1_000;
 const SELECTION_CANCEL_ACK_TIMEOUT_MS = 250;
 export const SELECTION_WAIT_REGISTRY = "__ticketAgentSelectionMachines_v1";
 export const FAKE_SELECTION_SINK_SELECTOR = '[data-ticket-agent-test-sink="browser-selection-v1"]';
@@ -135,6 +136,12 @@ export interface RunBrowserSelectionOptions {
   plan: BrowserSelectionPlan;
   timeoutMs: number;
   fallbackIntervalMs?: number;
+  /**
+   * Stay resident while the official queue is visible. No selection is
+   * attempted until that blocker disappears; every other blocker still stops
+   * the task immediately.
+   */
+  waitInOfficialQueue?: boolean;
   /** Only reserved test origins may set this. It clicks no real submit. */
   testOnlyFakeSubmit?: boolean;
   signal?: AbortSignal;
@@ -146,6 +153,7 @@ interface SerializedSelectionInput {
   plan: BrowserSelectionPlan;
   timeoutMs: number;
   fallbackIntervalMs: number;
+  waitInOfficialQueue: boolean;
   testOnlyFakeSubmit: boolean;
 }
 
@@ -397,12 +405,15 @@ function validateContract(contract: BrowserSelectionContract): BrowserSelectionC
 
 function validateOptions(options: RunBrowserSelectionOptions): SerializedSelectionInput {
   if (!options || typeof options !== "object") throw new Error("SELECTION_OPTIONS_INVALID");
-  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 50 || options.timeoutMs > 10 * 60 * 1_000) {
+  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 50 || options.timeoutMs > MAX_SELECTION_RESIDENCY_MS) {
     throw new Error("SELECTION_TIMEOUT_INVALID");
   }
   const fallbackIntervalMs = options.fallbackIntervalMs ?? DEFAULT_SELECTION_FALLBACK_INTERVAL_MS;
   if (!Number.isSafeInteger(fallbackIntervalMs) || fallbackIntervalMs < 10 || fallbackIntervalMs > 2_000) {
     throw new Error("SELECTION_FALLBACK_INVALID");
+  }
+  if (options.waitInOfficialQueue !== undefined && typeof options.waitInOfficialQueue !== "boolean") {
+    throw new Error("SELECTION_QUEUE_MODE_INVALID");
   }
   const contract = validateContract(options.contract);
   const plan = validatePlan(options.plan);
@@ -431,6 +442,7 @@ function validateOptions(options: RunBrowserSelectionOptions): SerializedSelecti
     plan,
     timeoutMs: options.timeoutMs,
     fallbackIntervalMs,
+    waitInOfficialQueue: options.waitInOfficialQueue === true,
     testOnlyFakeSubmit
   };
 }
@@ -646,24 +658,36 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
     if (current.username || current.password || !contract.allowedOrigins.includes(current.origin)) return "PAGE_ORIGIN_CHANGED";
     return undefined;
   };
-  const checkBlocking = (): { reason: SelectionBlockReason; key: string } | undefined => {
+  const checkBlocking = ():
+    | { disposition: "block"; reason: SelectionBlockReason; key: string }
+    | { disposition: "wait"; key: "official-queue-visible" }
+    | undefined => {
+    let officialQueueVisible = false;
     for (const predicate of contract.blockingPredicates) {
       let matches: Element[];
       try {
         matches = visibleAll(predicate.selector);
       } catch {
-        return { reason: "CONTRACT_SELECTOR_INVALID", key: predicate.key };
+        return { disposition: "block", reason: "CONTRACT_SELECTOR_INVALID", key: predicate.key };
       }
-      if (matches.length > 0) return { reason: "BLOCKING_STATE_VISIBLE", key: predicate.key };
+      if (matches.length === 0) continue;
+      if (input.waitInOfficialQueue && predicate.key === "official-queue-visible") {
+        officialQueueVisible = true;
+        continue;
+      }
+      return { disposition: "block", reason: "BLOCKING_STATE_VISIBLE", key: predicate.key };
     }
-    return undefined;
+    return officialQueueVisible ? { disposition: "wait", key: "official-queue-visible" } : undefined;
   };
   const checkEvent = (): SelectionBlockReason | undefined => {
-    const title = uniqueVisible(contract.eventTitleSelector);
-    if (title === undefined) return "EVENT_EVIDENCE_AMBIGUOUS";
+    const titles = visibleAll(contract.eventTitleSelector);
+    if (titles.length === 0) return "EVENT_EVIDENCE_MISSING";
+    if (titles.length > 1) return "EVENT_EVIDENCE_AMBIGUOUS";
+    const title = titles[0]!;
     if (identity(textOf(title)) !== identity(plan.eventTitle)) return "EVENT_TITLE_MISMATCH";
     const ids = visibleAll(contract.eventIdSelector);
-    if (ids.length !== 1) return "EVENT_EVIDENCE_AMBIGUOUS";
+    if (ids.length === 0) return "EVENT_EVIDENCE_MISSING";
+    if (ids.length > 1) return "EVENT_EVIDENCE_AMBIGUOUS";
     const observed = ids[0]!.getAttribute(contract.eventIdAttribute)?.trim();
     if (!observed) return "EVENT_EVIDENCE_MISSING";
     if (canonicalId(observed) !== canonicalId(plan.eventId)) return "EVENT_ID_MISMATCH";
@@ -879,22 +903,29 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
     inspecting = true;
     sourceName.value = source;
     try {
+      // This callback is synchronous. External script cannot change the page
+      // between stage transitions until we yield, and every reversible action
+      // yields for a continuation. One global guard pass per invocation is
+      // therefore both fail-closed and materially cheaper on a large DOM.
+      sourceStage.value = stage;
+      const boundaryNow = checkBoundary();
+      if (boundaryNow !== undefined) {
+        finish(stopped("blocked", boundaryNow));
+        return;
+      }
+      const blocking = checkBlocking();
+      if (blocking?.disposition === "block") {
+        finish(stopped("blocked", blocking.reason, blocking.key));
+        return;
+      }
+      if (blocking?.disposition === "wait") return;
+      const eventError = checkEvent();
+      if (eventError === "EVENT_EVIDENCE_MISSING") return;
+      if (eventError !== undefined) {
+        finish(stopped("blocked", eventError));
+        return;
+      }
       for (let transition = 0; transition < 16 && !settled; transition += 1) {
-        const boundaryNow = checkBoundary();
-        if (boundaryNow !== undefined) {
-          finish(stopped("blocked", boundaryNow));
-          return;
-        }
-        const blocking = checkBlocking();
-        if (blocking !== undefined) {
-          finish(stopped("blocked", blocking.reason, blocking.key));
-          return;
-        }
-        const eventError = checkEvent();
-        if (eventError !== undefined) {
-          finish(stopped("blocked", eventError));
-          return;
-        }
         sourceStage.value = stage;
         if (stage === "event") {
           stage = "session";

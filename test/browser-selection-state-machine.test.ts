@@ -5,6 +5,7 @@ import type { Page } from "playwright-core";
 
 import {
   browserSelectionTask,
+  MAX_SELECTION_RESIDENCY_MS,
   runBrowserSelectionStateMachine,
   type BrowserSelectionContract,
   type BrowserSelectionPlan
@@ -466,6 +467,28 @@ test("immediate abort leaves a pre-registration state-machine task cancelled", a
   }, page);
 });
 
+test("resident timeout covers T-10 through the bounded post-sale capability window", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const accepted = await runBrowserSelectionStateMachine(new InProcessPage().asPage(), {
+    contract,
+    plan,
+    timeoutMs: MAX_SELECTION_RESIDENCY_MS,
+    testOnlyFakeSubmit: true,
+    signal: controller.signal
+  });
+  assert.equal(accepted.outcome, "aborted");
+  await assert.rejects(
+    () => runBrowserSelectionStateMachine(new InProcessPage().asPage(), {
+      contract,
+      plan,
+      timeoutMs: MAX_SELECTION_RESIDENCY_MS + 1,
+      testOnlyFakeSubmit: true
+    }),
+    /SELECTION_TIMEOUT_INVALID/
+  );
+});
+
 test("test-only fake mode accepts an explicit ephemeral HTTP loopback origin", async () => {
   await withFakeDom(async (document, location, page) => {
     const fixture = installFixture(document);
@@ -573,6 +596,89 @@ for (const blocker of BLOCKERS) {
     });
   });
 }
+
+test("queue-resident mode waits for the official queue to clear in the same page task", async () => {
+  await withFakeDom(async (document, _location, page) => {
+    const fixture = installFixture(document);
+    const queue = new FakeElement(document, "div", "官方排队中");
+    document.set("[data-block-queue]", [queue], false);
+    const running = runBrowserSelectionStateMachine(page.asPage(), {
+      contract,
+      plan,
+      timeoutMs: 500,
+      fallbackIntervalMs: 20,
+      waitInOfficialQueue: true,
+      testOnlyFakeSubmit: true
+    });
+
+    assert.equal(fixture.session.clickCount, 0);
+    assert.equal(fixture.sink.clickCount, 0);
+    setTimeout(() => document.set("[data-block-queue]", []), 15);
+
+    const result = await running;
+    assert.equal(result.outcome, "test-clicked", JSON.stringify(result));
+    assert.equal(page.inputs.length, 1, "queue exit must not reinstall the browser task");
+    assert.equal(fixture.sink.clickCount, 1);
+  });
+});
+
+test("queue-resident mode never masks a captcha blocker", async () => {
+  await withFakeDom(async (document, _location, page) => {
+    const fixture = installFixture(document);
+    document.set("[data-block-queue]", [new FakeElement(document, "div", "官方排队中")], false);
+    document.set("[data-block-captcha]", [new FakeElement(document, "div", "人工验证")], false);
+    const result = await runBrowserSelectionStateMachine(page.asPage(), {
+      contract,
+      plan,
+      timeoutMs: 500,
+      waitInOfficialQueue: true,
+      testOnlyFakeSubmit: true
+    });
+    assert.equal(result.outcome, "blocked", JSON.stringify(result));
+    if (result.outcome !== "blocked") return;
+    assert.equal(result.reason, "BLOCKING_STATE_VISIBLE");
+    assert.equal(result.blockingKey, "captcha-visible");
+    assert.equal(fixture.session.clickCount, 0);
+    assert.equal(fixture.sink.clickCount, 0);
+  });
+});
+
+test("missing event evidence waits without action and resumes when the bound event appears", async () => {
+  await withFakeDom(async (document, _location, page) => {
+    const fixture = installFixture(document);
+    document.set(SELECTORS.eventTitle, [], false);
+    document.set(SELECTORS.eventId, [], false);
+    const running = runBrowserSelectionStateMachine(page.asPage(), {
+      contract,
+      plan,
+      timeoutMs: 500,
+      fallbackIntervalMs: 20,
+      testOnlyFakeSubmit: true
+    });
+
+    assert.equal(fixture.session.clickCount, 0);
+    assert.equal(fixture.sink.clickCount, 0);
+    setTimeout(() => {
+      document.set(
+        SELECTORS.eventTitle,
+        [new FakeElement(document, "h1", plan.eventTitle, { "data-contract-event-title": "" })],
+        false
+      );
+      document.set(
+        SELECTORS.eventId,
+        [new FakeElement(document, "main", "公开活动容器", {
+          "data-contract-event-id": "",
+          "data-event-id": plan.eventId
+        })]
+      );
+    }, 15);
+
+    const result = await running;
+    assert.equal(result.outcome, "test-clicked", JSON.stringify(result));
+    assert.equal(page.inputs.length, 1, "event hydration must not reinstall the browser task");
+    assert.equal(fixture.sink.clickCount, 1);
+  });
+});
 
 test("ambiguous total evidence blocks the final fake click", async () => {
   await withFakeDom(async (document, _location, page) => {
