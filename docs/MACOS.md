@@ -13,7 +13,7 @@ npm test
 
 不要把日常 Chrome 的目录、其父目录或 `Default` profile 配给执行器；live 与 sandbox profile 也不能相同或互为父子目录。首次使用 live 专用 profile 时，账号登录、实名观演人维护和安全验证都由用户在可见浏览器中完成。
 
-## 2. 当前无活动链接时
+## 2. 只读配置检查
 
 执行默认计划的只读检查：
 
@@ -23,6 +23,19 @@ npm run start:runner -- --dry-run --plan examples/default-damai-plan.json
 ```
 
 预期结果是 `REVIEW_REQUIRED`，且没有浏览器、网络请求或点击。
+
+已经确认可访问的低热度校准活动使用独立计划，不覆盖通用默认计划：
+
+```bash
+npm run build
+npm run start:runner -- --dry-run \
+  --plan examples/damai-iwwf-readonly-plan.json
+```
+
+该计划绑定大麦活动 ID `1067493715985`，固定为一张、最低价优先且
+`autoSubmitOrder=false`。首次真实页检查可能以 `PAGE_CHANGED` 或“缺少唯一订单总价”停止；
+详情页尚未进入选票/确认页时出现这一结果是预期的 selector 校准信号，不代表链接失效。
+`dry-run` 只读取页面，不点击“立即购票”、场次、票档、数量或提交控件。
 
 ## 3. 初始化 live 专用登录会话
 
@@ -39,7 +52,8 @@ npm run start:runner -- --login-only \
 
 ## 4. 获得大麦官方链接后
 
-1. 把官方 HTTPS 活动链接、准确活动标题/ID 和开售时间写入计划。
+1. 把官方 HTTPS 活动链接、准确活动标题/ID 和开售时间写入计划。校准计划可先只绑定活动 ID；
+   在真实标题 selector 审核通过前不要伪造 `eventTitle`，正式 live 计划必须同时绑定 ID 和标题。
 2. 先用 `dry-run` 做只读页面分析，记录实际可见的场次、票档、总价和页面状态；不提供账号密码、Cookie、身份证或支付信息。
 3. 根据真实页面更新并审核大麦 selector，完成页面改版、验证码、重定向和价格歧义测试。
 4. 用专用 profile 人工登录，演练到订单确认页，核对活动、场次、票档、数量、观演人和总价。

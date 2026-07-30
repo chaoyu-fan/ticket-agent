@@ -1,0 +1,12 @@
+{
+  "platform": "damai",
+  "officialUrl": "https://detail.damai.cn/item.htm?id=1067493715985",
+  "eventId": "1067493715985",
+  "quantity": 1,
+  "requireAdjacent": false,
+  "priceStrategy": "CHEAPEST_FIRST",
+  "autoSubmitOrder": false,
+  "sessions": [],
+  "tiers": [],
+  "attendeeAliases": []
+}

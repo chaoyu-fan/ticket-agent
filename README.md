@@ -6,7 +6,9 @@
 
 - 控制器、SQLite 审计、macOS Chrome 执行器和本地 mock 已完成。
 - 开售协调器会在远期保持 `SCHEDULED`，进入 10 分钟预热窗口后打开可见页面，并在同一官方队列页串行等待。
-- 大麦适配器完成了安全框架和仿真验证，但在拿到真实官方活动链接并审核页面前，`liveReady` 固定为 `false`。
+- 已取得并验证一个低热度大麦官方活动链接，专用只读计划位于
+  `examples/damai-iwwf-readonly-plan.json`；真实页面 selector 和确认页尚未审核，
+  因此 `liveReady` 继续固定为 `false`。
 - 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。
 - 当前默认值为 1 张、可见允许票档中最低价优先；未设置 `maxTotalFen` 时禁止自动提交。
 
@@ -29,6 +31,17 @@ npm run smoke
 npm run build
 npm run start:runner -- --dry-run --plan examples/default-damai-plan.json
 ```
+
+在 Mac 上对当前校准活动进行零点击真实页检查：
+
+```bash
+npm run build
+npm run start:runner -- --dry-run \
+  --plan examples/damai-iwwf-readonly-plan.json
+```
+
+真实详情页没有订单总价时，安全停止在 `PAGE_CHANGED` 是预期结果；这用于确认需要校准的
+页面证据，不会开启选票或下单。
 
 ## macOS 运行边界
 
