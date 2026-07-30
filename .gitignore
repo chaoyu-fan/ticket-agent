@@ -24,6 +24,13 @@ SandboxChromeProfile/
 .envrc
 .direnv/
 npm-debug.log*
+*.log
+playwright-report/
+test-results/
+trace/
+traces/
+screenshots/
+videos/
 *.pem
 *.key
 *.p12
