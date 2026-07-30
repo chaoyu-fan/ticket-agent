@@ -9,6 +9,10 @@ import {
   isAttendeeRef,
   parseAttendeeRefs
 } from "../identity/attendee-ref.js";
+import {
+  SUBMIT_CAPABILITY_MAX_LIFETIME_MS,
+  SUBMIT_CAPABILITY_VERSION
+} from "../security/submit-capability.js";
 import type {
   PlanStatus,
   Platform,
@@ -71,6 +75,8 @@ export interface SuccessConfirmationInput {
 export interface NoOrderReconciliationInput {
   confirmation: "NO_ORDER_EXISTS";
   eventKey: string;
+  /** Required when this run received an at-most-once fast-path delivery. */
+  deliveryId?: string;
   confirmedByUser: true;
 }
 
@@ -105,6 +111,58 @@ export interface PurchaseLock {
   status: PurchaseLockStatus;
   acquiredAt: string;
   updatedAt: string;
+}
+
+export type SubmitCapabilityGrantStatus =
+  | "DELIVERY_CLAIMED"
+  | "RUNNER_PREPARED"
+  | "CLICK_DISPATCHED"
+  | "OUTCOME_UNKNOWN"
+  | "CONSUME_REJECTED"
+  | "ZERO_CLICK_BLOCKED"
+  | "ORDER_CONFIRMED"
+  | "RECONCILED_NO_ORDER";
+
+export type SubmitAttemptOutcome =
+  | "CLICK_DISPATCHED"
+  | "OUTCOME_UNKNOWN"
+  | "CONSUME_REJECTED"
+  | "ZERO_CLICK_BLOCKED";
+
+export interface SubmitCapabilityGrant {
+  runId: string;
+  planId: string;
+  eventKey: string;
+  deliveryId: string;
+  capabilityVersion: number;
+  capabilityNonceSha256: `sha256:${string}`;
+  runnerSessionSha256: `sha256:${string}`;
+  claimsBodySha256: `sha256:${string}`;
+  issuedAtMs: number;
+  earliestSubmitAtMs: number;
+  expiresAtMs: number;
+  status: SubmitCapabilityGrantStatus;
+  attemptOutcome?: SubmitAttemptOutcome;
+  deliveryClaimedAt: string;
+  runnerPreparedAt?: string;
+  attemptedAt?: string;
+  updatedAt: string;
+}
+
+export interface SubmitCapabilityGrantClaimInput {
+  deliveryId: string;
+  capabilityVersion: number;
+  capabilityNonceSha256: `sha256:${string}`;
+  runnerSessionSha256: `sha256:${string}`;
+  claimsBodySha256: `sha256:${string}`;
+  issuedAtMs: number;
+  earliestSubmitAtMs: number;
+  expiresAtMs: number;
+}
+
+export interface SubmitCapabilityGrantClaimResult {
+  grant: SubmitCapabilityGrant;
+  run: PurchaseRun;
 }
 
 export interface ControllerStoreOptions {
@@ -157,6 +215,17 @@ const ERROR_STATES = new Set<RunState>([
   "SOLD_OUT",
   "DUPLICATE_BLOCKED",
   "FAILED"
+]);
+
+const SUBMIT_CAPABILITY_GRANT_STATUSES = new Set<SubmitCapabilityGrantStatus>([
+  "DELIVERY_CLAIMED",
+  "RUNNER_PREPARED",
+  "CLICK_DISPATCHED",
+  "OUTCOME_UNKNOWN",
+  "CONSUME_REJECTED",
+  "ZERO_CLICK_BLOCKED",
+  "ORDER_CONFIRMED",
+  "RECONCILED_NO_ORDER"
 ]);
 
 const ATTENDEE_IDENTITY_MIGRATION_REASON = "ATTENDEE_IDENTITY_MIGRATION_REQUIRED";
@@ -252,6 +321,45 @@ function lockFromRow(row: SqlRow): PurchaseLock {
     planId: String(column(row, "plan_id")),
     status: String(column(row, "status")) as PurchaseLockStatus,
     acquiredAt: String(column(row, "acquired_at")),
+    updatedAt: String(column(row, "updated_at"))
+  };
+}
+
+function submitCapabilityGrantFromRow(row: SqlRow): SubmitCapabilityGrant {
+  const status = String(column(row, "status")) as SubmitCapabilityGrantStatus;
+  if (!SUBMIT_CAPABILITY_GRANT_STATUSES.has(status)) {
+    throw new Error(`Invalid submit capability grant status in database: ${status}`);
+  }
+  const attemptOutcomeValue = asOptionalString(column(row, "attempt_outcome"));
+  const attemptOutcome = attemptOutcomeValue as SubmitAttemptOutcome | undefined;
+  if (
+    attemptOutcome !== undefined &&
+    attemptOutcome !== "CLICK_DISPATCHED" &&
+    attemptOutcome !== "OUTCOME_UNKNOWN" &&
+    attemptOutcome !== "CONSUME_REJECTED" &&
+    attemptOutcome !== "ZERO_CLICK_BLOCKED"
+  ) {
+    throw new Error(`Invalid submit attempt outcome in database: ${attemptOutcome}`);
+  }
+  const runnerPreparedAt = asOptionalString(column(row, "runner_prepared_at"));
+  const attemptedAt = asOptionalString(column(row, "attempted_at"));
+  return {
+    runId: String(column(row, "run_id")),
+    planId: String(column(row, "plan_id")),
+    eventKey: String(column(row, "event_key")),
+    deliveryId: String(column(row, "delivery_id")),
+    capabilityVersion: asNumber(column(row, "capability_version"), "capability_version"),
+    capabilityNonceSha256: String(column(row, "capability_nonce_sha256")) as `sha256:${string}`,
+    runnerSessionSha256: String(column(row, "runner_session_sha256")) as `sha256:${string}`,
+    claimsBodySha256: String(column(row, "claims_body_sha256")) as `sha256:${string}`,
+    issuedAtMs: asNumber(column(row, "issued_at_ms"), "issued_at_ms"),
+    earliestSubmitAtMs: asNumber(column(row, "earliest_submit_at_ms"), "earliest_submit_at_ms"),
+    expiresAtMs: asNumber(column(row, "expires_at_ms"), "expires_at_ms"),
+    status,
+    ...(attemptOutcome === undefined ? {} : { attemptOutcome }),
+    deliveryClaimedAt: String(column(row, "delivery_claimed_at")),
+    ...(runnerPreparedAt === undefined ? {} : { runnerPreparedAt }),
+    ...(attemptedAt === undefined ? {} : { attemptedAt }),
     updatedAt: String(column(row, "updated_at"))
   };
 }
@@ -441,6 +549,61 @@ function candidateFromPatch(current: WatchPlan, patch: WatchPlanPatch): WatchPla
   return candidate;
 }
 
+function validateSubmitCapabilityGrantClaimInput(
+  input: SubmitCapabilityGrantClaimInput
+): SubmitCapabilityGrantClaimInput {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "Grant claim must be an object", 422);
+  }
+  const expectedKeys = [
+    "capabilityNonceSha256",
+    "capabilityVersion",
+    "claimsBodySha256",
+    "deliveryId",
+    "earliestSubmitAtMs",
+    "expiresAtMs",
+    "issuedAtMs",
+    "runnerSessionSha256"
+  ].sort().join(",");
+  if (Object.keys(input).sort().join(",") !== expectedKeys) {
+    throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "Grant claim fields are invalid", 422);
+  }
+  if (
+    typeof input.deliveryId !== "string" ||
+    input.deliveryId.length < 1 ||
+    input.deliveryId.length > 200 ||
+    input.deliveryId.trim() !== input.deliveryId ||
+    /[\u0000-\u001f\u007f]/u.test(input.deliveryId)
+  ) {
+    throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "deliveryId is invalid", 422);
+  }
+  const digestPattern = /^sha256:[0-9a-f]{64}$/u;
+  for (const [field, value] of [
+    ["capabilityNonceSha256", input.capabilityNonceSha256],
+    ["runnerSessionSha256", input.runnerSessionSha256],
+    ["claimsBodySha256", input.claimsBodySha256]
+  ] as const) {
+    if (typeof value !== "string" || !digestPattern.test(value)) {
+      throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", `${field} is invalid`, 422);
+    }
+  }
+  if (input.capabilityVersion !== SUBMIT_CAPABILITY_VERSION) {
+    throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "Capability version is unsupported", 422);
+  }
+  if (
+    !Number.isSafeInteger(input.issuedAtMs) ||
+    !Number.isSafeInteger(input.earliestSubmitAtMs) ||
+    !Number.isSafeInteger(input.expiresAtMs) ||
+    input.issuedAtMs < 0 ||
+    input.earliestSubmitAtMs < input.issuedAtMs ||
+    input.expiresAtMs <= input.earliestSubmitAtMs ||
+    input.expiresAtMs - input.issuedAtMs > SUBMIT_CAPABILITY_MAX_LIFETIME_MS
+  ) {
+    throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "Capability times are invalid", 422);
+  }
+  return Object.freeze({ ...input });
+}
+
 export class ControllerStore {
   readonly database: DatabaseSync;
   private readonly now: () => string;
@@ -531,6 +694,31 @@ export class ControllerStore {
         acquired_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS submit_capability_grants (
+        run_id TEXT PRIMARY KEY REFERENCES purchase_runs(id) ON DELETE RESTRICT,
+        plan_id TEXT NOT NULL REFERENCES watch_plans(id) ON DELETE RESTRICT,
+        event_key TEXT NOT NULL,
+        delivery_id TEXT NOT NULL UNIQUE,
+        capability_version INTEGER NOT NULL,
+        capability_nonce_sha256 TEXT NOT NULL UNIQUE,
+        runner_session_sha256 TEXT NOT NULL UNIQUE,
+        claims_body_sha256 TEXT NOT NULL,
+        issued_at_ms INTEGER NOT NULL,
+        earliest_submit_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'DELIVERY_CLAIMED', 'RUNNER_PREPARED', 'CLICK_DISPATCHED', 'OUTCOME_UNKNOWN',
+          'CONSUME_REJECTED', 'ZERO_CLICK_BLOCKED', 'ORDER_CONFIRMED', 'RECONCILED_NO_ORDER'
+        )),
+        attempt_outcome TEXT CHECK(attempt_outcome IS NULL OR attempt_outcome IN (
+          'CLICK_DISPATCHED', 'OUTCOME_UNKNOWN', 'CONSUME_REJECTED', 'ZERO_CLICK_BLOCKED'
+        )),
+        delivery_claimed_at TEXT NOT NULL,
+        runner_prepared_at TEXT,
+        attempted_at TEXT,
+        updated_at TEXT NOT NULL
+      );
     `);
 
     // CREATE TABLE IF NOT EXISTS does not add fields to databases produced by
@@ -551,6 +739,8 @@ export class ControllerStore {
       CREATE INDEX IF NOT EXISTS purchase_runs_plan_idx ON purchase_runs(plan_id, created_at);
       CREATE INDEX IF NOT EXISTS run_state_audit_run_idx ON run_state_audit(run_id, id);
       CREATE INDEX IF NOT EXISTS plan_status_audit_plan_idx ON plan_status_audit(plan_id, id);
+      CREATE INDEX IF NOT EXISTS submit_capability_grants_event_idx
+      ON submit_capability_grants(event_key, status);
     `);
     if (scrubbedLegacyIdentity && this.databasePath !== ":memory:") {
       // Remove legacy alias bytes from both the main database and WAL rather
@@ -909,6 +1099,281 @@ export class ControllerStore {
     return run;
   }
 
+  getSubmitCapabilityGrant(runId: string): SubmitCapabilityGrant | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM submit_capability_grants WHERE run_id = ?")
+      .get(runId) as SqlRow | undefined;
+    return row === undefined ? undefined : submitCapabilityGrantFromRow(row);
+  }
+
+  getSubmitCapabilityGrantByDeliveryId(deliveryId: string): SubmitCapabilityGrant | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM submit_capability_grants WHERE delivery_id = ?")
+      .get(deliveryId) as SqlRow | undefined;
+    return row === undefined ? undefined : submitCapabilityGrantFromRow(row);
+  }
+
+  private requireActiveSubmitCapabilityRuntime(grant: SubmitCapabilityGrant): {
+    run: PurchaseRun;
+    plan: WatchPlan;
+    lock: PurchaseLock;
+  } {
+    const run = this.requireRun(grant.runId);
+    const plan = this.requirePlan(grant.planId);
+    const lock = this.getPurchaseLockForRun(grant.runId);
+    if (
+      run.planId !== grant.planId ||
+      run.state !== "PREWARM" ||
+      plan.status !== "RUNNING" ||
+      lock === undefined ||
+      lock.status !== "HELD" ||
+      lock.runId !== grant.runId ||
+      lock.planId !== grant.planId ||
+      lock.eventKey !== grant.eventKey
+    ) {
+      throw new ControllerError(
+        "SUBMIT_CAPABILITY_RUNTIME_MISMATCH",
+        "Active capability requires the bound PREWARM run, RUNNING plan, and HELD purchase lock",
+        409
+      );
+    }
+    return { run, plan, lock };
+  }
+
+  /**
+   * Atomically burn one delivery, acquire the sticky purchase lock, and move
+   * the run into PREWARM. The signed envelope is deliberately not accepted or
+   * stored here; a service may return it only after this transaction commits.
+   */
+  claimSubmitCapabilityDelivery(
+    runId: string,
+    claimInput: SubmitCapabilityGrantClaimInput
+  ): SubmitCapabilityGrantClaimResult {
+    const input = validateSubmitCapabilityGrantClaimInput(claimInput);
+    return this.inTransaction(() => {
+      const current = this.requireRun(runId);
+      const plan = this.requirePlan(current.planId);
+      if (this.getSubmitCapabilityGrant(runId) !== undefined) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_ALREADY_DELIVERED",
+          "This run already burned its at-most-once capability delivery",
+          409
+        );
+      }
+      if (current.state !== "SCHEDULED" || plan.status !== "ARMED") {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_RUN_NOT_CLAIMABLE",
+          `Capability delivery requires an ARMED/SCHEDULED run, not ${plan.status}/${current.state}`,
+          409
+        );
+      }
+      const validation = validatePlan(plan);
+      if (!validation.ok || !plan.autoSubmitOrder || plan.maxTotalFen === undefined || plan.saleAt === undefined) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_PLAN_INVALID",
+          "A fully validated automatic-submit plan is required before capability delivery",
+          409,
+          validation.errors
+        );
+      }
+      const saleAtMs = Date.parse(plan.saleAt);
+      if (!Number.isSafeInteger(saleAtMs) || input.earliestSubmitAtMs !== saleAtMs) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_TIME_MISMATCH",
+          "Capability earliest-submit time must exactly match the armed saleAt",
+          409
+        );
+      }
+      const eventKey = canonicalKeyForPlan(plan);
+      if (eventKey === undefined) {
+        throw new ControllerError(
+          "EVENT_IDENTITY_REQUIRED",
+          "Capability delivery requires the armed canonical event identity",
+          409
+        );
+      }
+      const existingByDelivery = this.getSubmitCapabilityGrantByDeliveryId(input.deliveryId);
+      if (existingByDelivery !== undefined) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_ALREADY_DELIVERED",
+          "deliveryId was already burned",
+          409
+        );
+      }
+      const at = this.now();
+      if (!this.tryAcquirePurchaseLock(plan, current.id, eventKey, at)) {
+        throw new ControllerError(
+          "DUPLICATE_PURCHASE_LOCKED",
+          "Another run owns the purchase lock for this event",
+          409
+        );
+      }
+      try {
+        this.database.prepare(`
+          INSERT INTO submit_capability_grants (
+            run_id, plan_id, event_key, delivery_id, capability_version,
+            capability_nonce_sha256, runner_session_sha256, claims_body_sha256,
+            issued_at_ms, earliest_submit_at_ms, expires_at_ms, status, attempt_outcome,
+            delivery_claimed_at, runner_prepared_at, attempted_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DELIVERY_CLAIMED', NULL, ?, NULL, NULL, ?)
+        `).run(
+          current.id,
+          plan.id,
+          eventKey,
+          input.deliveryId,
+          input.capabilityVersion,
+          input.capabilityNonceSha256,
+          input.runnerSessionSha256,
+          input.claimsBodySha256,
+          input.issuedAtMs,
+          input.earliestSubmitAtMs,
+          input.expiresAtMs,
+          at,
+          at
+        );
+      } catch (error) {
+        if (
+          this.getSubmitCapabilityGrant(runId) !== undefined ||
+          this.getSubmitCapabilityGrantByDeliveryId(input.deliveryId) !== undefined
+        ) {
+          throw new ControllerError(
+            "SUBMIT_CAPABILITY_ALREADY_DELIVERED",
+            "Capability delivery metadata was already burned",
+            409
+          );
+        }
+        throw error;
+      }
+      const preparedRun: PurchaseRun = {
+        ...current,
+        state: transition(current.state, "PREWARM"),
+        updatedAt: at
+      };
+      this.persistRun(preparedRun);
+      this.insertRunAudit(
+        preparedRun.id,
+        current.state,
+        preparedRun.state,
+        "SUBMIT_CAPABILITY_DELIVERY_CLAIMED",
+        preparedRun,
+        at
+      );
+      this.updatePlanStatusForRun(plan, preparedRun, at);
+      const grant = this.getSubmitCapabilityGrant(runId);
+      if (grant === undefined) throw new Error("SUBMIT_CAPABILITY_GRANT_INSERT_FAILED");
+      return { grant, run: preparedRun };
+    });
+  }
+
+  ackSubmitCapabilityPrepared(runId: string, deliveryId: string): SubmitCapabilityGrant {
+    if (typeof deliveryId !== "string" || deliveryId.length < 1 || deliveryId.length > 200) {
+      throw new ControllerError("SUBMIT_CAPABILITY_GRANT_INVALID", "deliveryId is invalid", 422);
+    }
+    return this.inTransaction(() => {
+      const grant = this.getSubmitCapabilityGrant(runId);
+      if (grant === undefined) {
+        throw new ControllerError("SUBMIT_CAPABILITY_GRANT_NOT_FOUND", "No capability grant exists", 404);
+      }
+      if (grant.deliveryId !== deliveryId) {
+        throw new ControllerError("SUBMIT_CAPABILITY_DELIVERY_MISMATCH", "deliveryId does not match", 409);
+      }
+      if (grant.status === "RUNNER_PREPARED") {
+        this.requireActiveSubmitCapabilityRuntime(grant);
+        return grant;
+      }
+      if (grant.status !== "DELIVERY_CLAIMED") {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_GRANT_FINALIZED",
+          `Cannot acknowledge a ${grant.status} grant as prepared`,
+          409
+        );
+      }
+      const at = this.now();
+      if (grant.expiresAtMs <= Date.parse(at)) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_EXPIRED",
+          "An expired capability cannot be acknowledged as prepared",
+          409
+        );
+      }
+      this.requireActiveSubmitCapabilityRuntime(grant);
+      this.database.prepare(`
+        UPDATE submit_capability_grants
+        SET status = 'RUNNER_PREPARED', runner_prepared_at = ?, updated_at = ?
+        WHERE run_id = ? AND status = 'DELIVERY_CLAIMED'
+      `).run(at, at, runId);
+      const updated = this.getSubmitCapabilityGrant(runId);
+      if (updated === undefined) throw new Error("SUBMIT_CAPABILITY_GRANT_UPDATE_FAILED");
+      return updated;
+    });
+  }
+
+  recordSubmitAttemptOutcome(
+    runId: string,
+    deliveryId: string,
+    outcome: SubmitAttemptOutcome
+  ): SubmitCapabilityGrant {
+    if (
+      typeof deliveryId !== "string" ||
+      !new Set<SubmitAttemptOutcome>([
+        "CLICK_DISPATCHED",
+        "OUTCOME_UNKNOWN",
+        "CONSUME_REJECTED",
+        "ZERO_CLICK_BLOCKED"
+      ]).has(outcome)
+    ) {
+      throw new ControllerError("SUBMIT_CAPABILITY_ATTEMPT_INVALID", "Attempt report is invalid", 422);
+    }
+    return this.inTransaction(() => {
+      const grant = this.getSubmitCapabilityGrant(runId);
+      if (grant === undefined) {
+        throw new ControllerError("SUBMIT_CAPABILITY_GRANT_NOT_FOUND", "No capability grant exists", 404);
+      }
+      if (grant.deliveryId !== deliveryId) {
+        throw new ControllerError("SUBMIT_CAPABILITY_DELIVERY_MISMATCH", "deliveryId does not match", 409);
+      }
+      if (grant.status === outcome && grant.attemptOutcome === outcome) return grant;
+      const deliveryAbandonedBeforePrepare =
+        grant.status === "DELIVERY_CLAIMED" && outcome === "ZERO_CLICK_BLOCKED";
+      if (grant.status !== "RUNNER_PREPARED" && !deliveryAbandonedBeforePrepare) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_ATTEMPT_ALREADY_RECORDED",
+          `Grant is ${grant.status}; this outcome cannot finalize it`,
+          409
+        );
+      }
+      const { run: current, plan } = this.requireActiveSubmitCapabilityRuntime(grant);
+      const at = this.now();
+      this.database.prepare(`
+        UPDATE submit_capability_grants
+        SET status = ?, attempt_outcome = ?, attempted_at = ?, updated_at = ?
+        WHERE run_id = ? AND status IN ('DELIVERY_CLAIMED', 'RUNNER_PREPARED')
+      `).run(outcome, outcome, at, at, runId);
+      const nextState: RunState = outcome === "CLICK_DISPATCHED" || outcome === "OUTCOME_UNKNOWN"
+        ? "HUMAN_TAKEOVER"
+        : "FAILED";
+      const updatedRun: PurchaseRun = {
+        ...current,
+        state: transition(current.state, nextState),
+        lastError: `FAST_PATH_${outcome}`,
+        updatedAt: at
+      };
+      this.persistRun(updatedRun);
+      this.insertRunAudit(
+        updatedRun.id,
+        current.state,
+        updatedRun.state,
+        `FAST_PATH_${outcome}`,
+        updatedRun,
+        at
+      );
+      this.updatePlanStatusForRun(plan, updatedRun, at);
+      const updated = this.getSubmitCapabilityGrant(runId);
+      if (updated === undefined) throw new Error("SUBMIT_CAPABILITY_GRANT_UPDATE_FAILED");
+      return updated;
+    });
+  }
+
   listRuns(planId?: string): PurchaseRun[] {
     const rows = (planId === undefined
       ? this.database.prepare("SELECT * FROM purchase_runs ORDER BY created_at, id").all()
@@ -994,6 +1459,13 @@ export class ControllerStore {
     return this.inTransaction(() => {
       const current = this.requireRun(event.runId);
       const plan = this.requirePlan(current.planId);
+      if (this.getSubmitCapabilityGrant(event.runId) !== undefined) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_GRANT_EXISTS",
+          "Generic runner events are disabled after fast-path capability delivery",
+          409
+        );
+      }
       if (plan.status === "CANCELLED" || plan.status === "COMPLETED" || plan.status === "PAUSED") {
         throw new ControllerError("PLAN_NOT_RUNNING", `Cannot update a ${plan.status} plan`, 409);
       }
@@ -1085,6 +1557,13 @@ export class ControllerStore {
     return this.inTransaction(() => {
       const current = this.requireRun(runId);
       const plan = this.requirePlan(current.planId);
+      if (this.getSubmitCapabilityGrant(runId) !== undefined) {
+        throw new ControllerError(
+          "SUBMIT_CAPABILITY_GRANT_EXISTS",
+          "Legacy approve-submit is disabled after fast-path capability delivery",
+          409
+        );
+      }
       if (plan.status === "CANCELLED" || plan.status === "COMPLETED" || plan.status === "PAUSED") {
         throw new ControllerError("PLAN_NOT_RUNNING", `Cannot authorize a ${plan.status} plan`, 409);
       }
@@ -1202,8 +1681,12 @@ export class ControllerStore {
         }
         return current;
       }
+      const capabilityGrant = this.getSubmitCapabilityGrant(runId);
+      const fastPathAttemptMayHaveClicked =
+        current.state === "PREWARM" &&
+        (capabilityGrant?.status === "CLICK_DISPATCHED" || capabilityGrant?.status === "OUTCOME_UNKNOWN");
       const confirmableStates = new Set<RunState>(["SUBMIT_ORDER", "PAY_REQUIRED", "HUMAN_TAKEOVER", "FAILED"]);
-      if (!confirmableStates.has(current.state)) {
+      if (!confirmableStates.has(current.state) && !fastPathAttemptMayHaveClicked) {
         throw new ControllerError("RUN_NOT_CONFIRMABLE", `Cannot confirm success from ${current.state}`, 409);
       }
       if (current.orderReference !== undefined && current.orderReference !== orderReference) {
@@ -1236,6 +1719,13 @@ export class ControllerStore {
       this.database
         .prepare("UPDATE purchase_locks SET status = 'PURCHASED', updated_at = ? WHERE run_id = ?")
         .run(at, confirmed.id);
+      if (capabilityGrant !== undefined) {
+        this.database.prepare(`
+          UPDATE submit_capability_grants
+          SET status = 'ORDER_CONFIRMED', updated_at = ?
+          WHERE run_id = ? AND status IN ('CLICK_DISPATCHED', 'OUTCOME_UNKNOWN')
+        `).run(at, confirmed.id);
+      }
       this.updatePlanStatusForRun(plan, confirmed, at);
       return confirmed;
     });
@@ -1320,7 +1810,8 @@ export class ControllerStore {
       input.confirmation !== "NO_ORDER_EXISTS" ||
       input.confirmedByUser !== true ||
       typeof input.eventKey !== "string" ||
-      input.eventKey === ""
+      input.eventKey === "" ||
+      (input.deliveryId !== undefined && (typeof input.deliveryId !== "string" || input.deliveryId === ""))
     ) {
       throw new ControllerError(
         "CONFIRMATION_REQUIRED",
@@ -1350,8 +1841,32 @@ export class ControllerStore {
       if (input.eventKey !== lock.eventKey) {
         throw new ControllerError("EVENT_KEY_MISMATCH", "Confirmed eventKey does not match the held lock", 409);
       }
+      const grant = this.getSubmitCapabilityGrant(runId);
+      if (grant !== undefined) {
+        if (input.deliveryId !== grant.deliveryId) {
+          throw new ControllerError(
+            "SUBMIT_CAPABILITY_DELIVERY_MISMATCH",
+            "The exact deliveryId is required to reconcile a fast-path grant",
+            409
+          );
+        }
+        if (grant.status === "ORDER_CONFIRMED") {
+          throw new ControllerError(
+            "PURCHASE_ALREADY_RECORDED",
+            "An order-confirmed capability grant cannot be reconciled as no-order",
+            409
+          );
+        }
+      }
       this.database.prepare("DELETE FROM purchase_locks WHERE run_id = ?").run(runId);
       const at = this.now();
+      if (grant !== undefined) {
+        this.database.prepare(`
+          UPDATE submit_capability_grants
+          SET status = 'RECONCILED_NO_ORDER', updated_at = ?
+          WHERE run_id = ?
+        `).run(at, runId);
+      }
       this.insertRunAudit(run.id, run.state, run.state, "NO_ORDER_CONFIRMED_LOCK_RELEASED", run, at);
     });
   }

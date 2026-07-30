@@ -22,3 +22,9 @@ export {
   type ControllerHttpOptions,
   type ListenControllerOptions
 } from "./http.js";
+export {
+  SubmitCapabilityService,
+  type ClaimSubmitCapabilityInput,
+  type ClaimSubmitCapabilityResult,
+  type SubmitCapabilityServiceOptions
+} from "./submit-capability-service.js";

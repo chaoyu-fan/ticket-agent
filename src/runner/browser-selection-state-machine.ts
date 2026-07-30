@@ -21,7 +21,9 @@ import type { Page } from "playwright-core";
 export const DEFAULT_SELECTION_FALLBACK_INTERVAL_MS = 16;
 export const MAX_SELECTION_RESIDENCY_MS = 30 * 60 * 1_000;
 const SELECTION_CANCEL_ACK_TIMEOUT_MS = 250;
+const SELECTION_RESIDENCY_ACK_TIMEOUT_MS = 1_000;
 export const SELECTION_WAIT_REGISTRY = "__ticketAgentSelectionMachines_v1";
+export const SELECTION_RESIDENCY_REGISTRY = "__ticketAgentSelectionResidency_v1";
 export const FAKE_SELECTION_SINK_SELECTOR = '[data-ticket-agent-test-sink="browser-selection-v1"]';
 
 export type SelectionStage =
@@ -55,6 +57,8 @@ export type SelectionBlockReason =
   | "ADJACENCY_EVIDENCE_INVALID"
   | "TOTAL_EVIDENCE_INVALID"
   | "PRICE_LIMIT_EXCEEDED"
+  | "SUBMIT_READINESS_AMBIGUOUS"
+  | "SUBMIT_READINESS_EVIDENCE_INVALID"
   | "FAKE_SINK_INVALID"
   | "FAKE_SINK_CLICK_OUTCOME_UNKNOWN"
   | "PAGE_CHANGED_AFTER_FAKE_CLICK"
@@ -131,6 +135,20 @@ export interface BrowserSelectionPlan {
   requireAdjacent: boolean;
 }
 
+/**
+ * Read-only evidence that the reviewed irreversible control is actually
+ * available. The resident task may observe it but can never click it.
+ */
+export interface FastPathSubmitReadinessContract {
+  selector: string;
+  /** Optional selector scoped to the unique submit control. */
+  labelSelector?: string;
+  /** Optional reviewed label attribute, for example `aria-label` or `value`. */
+  labelAttribute?: string;
+  /** Exact, pre-reviewed visible labels accepted for this control. */
+  allowedLabels: readonly string[];
+}
+
 export interface RunBrowserSelectionOptions {
   contract: BrowserSelectionContract;
   plan: BrowserSelectionPlan;
@@ -142,9 +160,13 @@ export interface RunBrowserSelectionOptions {
    * the task immediately.
    */
   waitInOfficialQueue?: boolean;
+  /** Optional production fast-path gate; it remains read-only in this task. */
+  submitReadiness?: FastPathSubmitReadinessContract;
   /** Only reserved test origins may set this. It clicks no real submit. */
   testOnlyFakeSubmit?: boolean;
   signal?: AbortSignal;
+  /** Internal correlation key used by `startBrowserSelectionStateMachine`. */
+  residencyAckId?: string;
 }
 
 interface SerializedSelectionInput {
@@ -154,7 +176,15 @@ interface SerializedSelectionInput {
   timeoutMs: number;
   fallbackIntervalMs: number;
   waitInOfficialQueue: boolean;
+  submitReadiness?: FastPathSubmitReadinessContract;
   testOnlyFakeSubmit: boolean;
+  residencyAckId?: string;
+}
+
+export interface BrowserSelectionResidentTask {
+  /** Resolves only after MutationObserver, fallback, timeout, and cancel registration exist in the page. */
+  readonly armed: Promise<void>;
+  readonly result: Promise<BrowserSelectionResult>;
 }
 
 type BrowserSelectionRegistryEntry = (() => void) | "cancelled";
@@ -217,6 +247,53 @@ function normalizeLabel(value: string): string {
   return value.normalize("NFKC").replace(/\s+/g, "").trim();
 }
 
+export function validateFastPathSubmitReadiness(
+  value: FastPathSubmitReadinessContract | undefined,
+  forbiddenActionSelectors: readonly string[]
+): FastPathSubmitReadinessContract | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Object.keys(value).some((key) => !["allowedLabels", "labelAttribute", "labelSelector", "selector"].includes(key)) ||
+    !selectorString(value.selector)
+  ) {
+    throw new Error("SELECTION_SUBMIT_READINESS_INVALID");
+  }
+  if (value.labelSelector !== undefined && !selectorString(value.labelSelector)) {
+    throw new Error("SELECTION_SUBMIT_READINESS_LABEL_SELECTOR_INVALID");
+  }
+  if (!validateAttribute(value.labelAttribute, false)) {
+    throw new Error("SELECTION_SUBMIT_READINESS_LABEL_ATTRIBUTE_INVALID");
+  }
+  if (
+    !Array.isArray(value.allowedLabels) ||
+    value.allowedLabels.length < 1 ||
+    value.allowedLabels.length > 16
+  ) {
+    throw new Error("SELECTION_SUBMIT_READINESS_LABELS_INVALID");
+  }
+  const labels = value.allowedLabels.map((label) => {
+    if (!fixedString(label, 200) || !normalizeLabel(label)) {
+      throw new Error("SELECTION_SUBMIT_READINESS_LABELS_INVALID");
+    }
+    return label.trim();
+  });
+  if (new Set(labels.map(normalizeLabel)).size !== labels.length) {
+    throw new Error("SELECTION_SUBMIT_READINESS_LABELS_INVALID");
+  }
+  const selector = value.selector.trim();
+  if (!forbiddenActionSelectors.includes(selector)) {
+    throw new Error("SELECTION_SUBMIT_READINESS_NOT_FORBIDDEN");
+  }
+  return {
+    selector,
+    ...(value.labelSelector === undefined ? {} : { labelSelector: value.labelSelector.trim() }),
+    ...(value.labelAttribute === undefined ? {} : { labelAttribute: value.labelAttribute.trim() }),
+    allowedLabels: Object.freeze(labels)
+  };
+}
+
 function validateOrigin(value: unknown): string {
   if (!fixedString(value, 300)) throw new Error("SELECTION_ORIGIN_INVALID");
   let parsed: URL;
@@ -271,7 +348,7 @@ function validateChoice(choice: SelectionChoiceContract, name: string, requirePr
   };
 }
 
-function validatePlan(plan: BrowserSelectionPlan): BrowserSelectionPlan {
+export function validateBrowserSelectionPlan(plan: BrowserSelectionPlan): BrowserSelectionPlan {
   if (!plan || typeof plan !== "object") throw new Error("SELECTION_PLAN_INVALID");
   if (!fixedString(plan.eventId, 200) || !fixedString(plan.eventTitle, 300)) throw new Error("SELECTION_EVENT_IDENTITY_INVALID");
   if (!Number.isSafeInteger(plan.quantity) || plan.quantity < 1 || plan.quantity > 6) {
@@ -318,7 +395,7 @@ function validatePlan(plan: BrowserSelectionPlan): BrowserSelectionPlan {
   };
 }
 
-function validateContract(contract: BrowserSelectionContract): BrowserSelectionContract {
+export function validateBrowserSelectionContract(contract: BrowserSelectionContract): BrowserSelectionContract {
   if (!contract || typeof contract !== "object") throw new Error("SELECTION_CONTRACT_INVALID");
   if (contract.platform !== "damai" && contract.platform !== "maoyan") throw new Error("SELECTION_PLATFORM_INVALID");
   if (!Array.isArray(contract.allowedOrigins) || contract.allowedOrigins.length < 1 || contract.allowedOrigins.length > 8) {
@@ -415,8 +492,18 @@ function validateOptions(options: RunBrowserSelectionOptions): SerializedSelecti
   if (options.waitInOfficialQueue !== undefined && typeof options.waitInOfficialQueue !== "boolean") {
     throw new Error("SELECTION_QUEUE_MODE_INVALID");
   }
-  const contract = validateContract(options.contract);
-  const plan = validatePlan(options.plan);
+  if (
+    options.residencyAckId !== undefined &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(options.residencyAckId)
+  ) {
+    throw new Error("SELECTION_RESIDENCY_ACK_ID_INVALID");
+  }
+  const contract = validateBrowserSelectionContract(options.contract);
+  const plan = validateBrowserSelectionPlan(options.plan);
+  const submitReadiness = validateFastPathSubmitReadiness(
+    options.submitReadiness,
+    contract.forbiddenActionSelectors
+  );
   const testOnlyFakeSubmit = options.testOnlyFakeSubmit === true;
   const originHostAllowed = (origin: string): boolean => {
     const parsed = new URL(origin);
@@ -443,7 +530,9 @@ function validateOptions(options: RunBrowserSelectionOptions): SerializedSelecti
     timeoutMs: options.timeoutMs,
     fallbackIntervalMs,
     waitInOfficialQueue: options.waitInOfficialQueue === true,
-    testOnlyFakeSubmit
+    ...(submitReadiness === undefined ? {} : { submitReadiness }),
+    testOnlyFakeSubmit,
+    ...(options.residencyAckId === undefined ? {} : { residencyAckId: options.residencyAckId })
   };
 }
 
@@ -455,16 +544,41 @@ function validateOptions(options: RunBrowserSelectionOptions): SerializedSelecti
 export function browserSelectionTask(input: SerializedSelectionInput): Promise<BrowserSelectionPageResult> {
   const startedAt = performance.now();
   const registryName = "__ticketAgentSelectionMachines_v1";
+  const residencyRegistryName = "__ticketAgentSelectionResidency_v1";
+  const residencyEventName = "__ticketAgentSelectionResidencyChanged_v1";
   const scope = globalThis as typeof globalThis & {
     __ticketAgentSelectionMachines_v1?: Record<string, BrowserSelectionRegistryEntry | undefined>;
+    __ticketAgentSelectionResidency_v1?: Record<string, "starting" | "armed" | "failed" | undefined>;
   };
   const registry = scope[registryName] ??= Object.create(null) as Record<string, BrowserSelectionRegistryEntry | undefined>;
+  const residencyRegistry = scope[residencyRegistryName] ??= Object.create(null) as Record<
+    string,
+    "starting" | "armed" | "failed" | undefined
+  >;
   const contract = input.contract;
   const plan = input.plan;
   const sourceStage: { value: SelectionStage } = { value: "event" };
   const sourceName: { value: Exclude<SelectionSource, "timeout" | "abort"> } = { value: "initial" };
   let reversibleActionCount = 0;
   let fakeClickCount: 0 | 1 = 0;
+
+  const signalResidency = (status: "starting" | "armed" | "failed"): void => {
+    const residencyAckId = input.residencyAckId;
+    if (residencyAckId === undefined) return;
+    residencyRegistry[residencyAckId] = status;
+    try {
+      globalThis.dispatchEvent(new CustomEvent(residencyEventName, { detail: residencyAckId }));
+    } catch {
+      // The registry remains authoritative if event dispatch is unavailable.
+    }
+    if (status !== "starting") {
+      const cleanupTimer = setTimeout(() => {
+        if (residencyRegistry[residencyAckId] === status) delete residencyRegistry[residencyAckId];
+      }, 30_000);
+      (cleanupTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+    }
+  };
+  signalResidency("starting");
 
   const elapsed = (): number => Math.max(0, performance.now() - startedAt);
   const stopped = (
@@ -645,6 +759,12 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
       if (contract.quantity.option.clickSelector !== undefined) selectors.push(contract.quantity.option.clickSelector);
     }
     if (contract.quantity.select !== undefined) selectors.push(contract.quantity.select.controlSelector);
+    if (input.submitReadiness !== undefined) {
+      selectors.push(input.submitReadiness.selector);
+      if (input.submitReadiness.labelSelector !== undefined) {
+        selectors.push(input.submitReadiness.labelSelector);
+      }
+    }
     return selectors.every(validSelector);
   };
   const checkBoundary = (): SelectionBlockReason | undefined => {
@@ -721,11 +841,18 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
 
   if (registry[input.runId] === "cancelled") {
     delete registry[input.runId];
+    signalResidency("failed");
     return Promise.resolve(stopped("aborted"));
   }
-  if (!validateSelectors()) return Promise.resolve(stopped("blocked", "CONTRACT_SELECTOR_INVALID"));
+  if (!validateSelectors()) {
+    signalResidency("failed");
+    return Promise.resolve(stopped("blocked", "CONTRACT_SELECTOR_INVALID"));
+  }
   const boundary = checkBoundary();
-  if (boundary !== undefined) return Promise.resolve(stopped("blocked", boundary));
+  if (boundary !== undefined) {
+    signalResidency("failed");
+    return Promise.resolve(stopped("blocked", boundary));
+  }
 
   let stage: SelectionStage = "event";
   sourceStage.value = stage;
@@ -1243,6 +1370,37 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
             finish(stopped("blocked", "PRICE_LIMIT_EXCEEDED"));
             return;
           }
+          if (input.submitReadiness !== undefined) {
+            const submitControls = visibleAll(input.submitReadiness.selector);
+            if (submitControls.length > 1) {
+              finish(stopped("blocked", "SUBMIT_READINESS_AMBIGUOUS"));
+              return;
+            }
+            if (submitControls.length === 0 || !enabled(submitControls[0]!)) return;
+            const labelElement = scopedUnique(submitControls[0]!, input.submitReadiness.labelSelector);
+            if (labelElement === undefined) {
+              finish(stopped("blocked", "SUBMIT_READINESS_EVIDENCE_INVALID"));
+              return;
+            }
+            const visibleLabel = normalized(textOf(labelElement));
+            const attributeName = input.submitReadiness.labelAttribute;
+            const attributeLabel = attributeName === undefined
+              ? ""
+              : normalized(labelElement.getAttribute(attributeName) ?? "");
+            if (
+              (attributeName === undefined && visibleLabel === "") ||
+              (attributeName !== undefined && attributeLabel === "") ||
+              (visibleLabel !== "" && attributeLabel !== "" && visibleLabel !== attributeLabel)
+            ) {
+              finish(stopped("blocked", "SUBMIT_READINESS_EVIDENCE_INVALID"));
+              return;
+            }
+            const submitLabel = attributeName === undefined ? visibleLabel : attributeLabel;
+            if (!input.submitReadiness.allowedLabels.some((label) => normalized(label) === submitLabel)) {
+              finish(stopped("blocked", "SUBMIT_READINESS_EVIDENCE_INVALID"));
+              return;
+            }
+          }
           if (!input.testOnlyFakeSubmit) {
             finish(ready("ready", source));
             return;
@@ -1306,11 +1464,90 @@ export function browserSelectionTask(input: SerializedSelectionInput): Promise<B
       });
       fallbackTimer = setInterval(() => inspect("fallback"), input.fallbackIntervalMs);
       timeoutTimer = setTimeout(() => finish(stopped("timeout")), input.timeoutMs);
+      signalResidency("armed");
       inspect("initial");
     } catch {
+      signalResidency("failed");
       finish(stopped("blocked", "PAGE_CONTEXT_INVALID"));
     }
   });
+}
+
+/** Self-contained page task used only before T0 to acknowledge observer residency. */
+export function browserSelectionResidencyAckTask(input: {
+  residencyAckId: string;
+  timeoutMs: number;
+}): Promise<boolean> {
+  const residencyEventName = "__ticketAgentSelectionResidencyChanged_v1";
+  const scope = globalThis as typeof globalThis & {
+    __ticketAgentSelectionResidency_v1?: Record<string, "starting" | "armed" | "failed" | undefined>;
+  };
+  const registry = scope.__ticketAgentSelectionResidency_v1 ??= Object.create(null) as Record<
+    string,
+    "starting" | "armed" | "failed" | undefined
+  >;
+  return new Promise<boolean>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let fallback: ReturnType<typeof setInterval> | undefined;
+    const eventTarget = globalThis as typeof globalThis & {
+      addEventListener?: (name: string, listener: (event: Event) => void) => void;
+      removeEventListener?: (name: string, listener: (event: Event) => void) => void;
+    };
+    const finish = (armed: boolean): void => {
+      eventTarget.removeEventListener?.(residencyEventName, changed);
+      if (timer !== undefined) clearTimeout(timer);
+      if (fallback !== undefined) clearInterval(fallback);
+      delete registry[input.residencyAckId];
+      resolve(armed);
+    };
+    const inspect = (): boolean => {
+      const status = registry[input.residencyAckId];
+      if (status === "armed") {
+        finish(true);
+        return true;
+      }
+      if (status === "failed") {
+        finish(false);
+        return true;
+      }
+      return false;
+    };
+    const changed = (event: Event): void => {
+      if (event instanceof CustomEvent && event.detail === input.residencyAckId) inspect();
+    };
+    eventTarget.addEventListener?.(residencyEventName, changed);
+    if (inspect()) return;
+    if (typeof eventTarget.addEventListener !== "function") {
+      fallback = setInterval(inspect, 1);
+    }
+    timer = setTimeout(() => finish(false), input.timeoutMs);
+  });
+}
+
+/**
+ * Starts the reversible browser task and exposes an explicit pre-capability
+ * acknowledgement that its MutationObserver is resident in the page.
+ */
+export function startBrowserSelectionStateMachine(
+  page: Pick<Page, "evaluate">,
+  options: RunBrowserSelectionOptions
+): BrowserSelectionResidentTask {
+  const residencyAckId = randomUUID();
+  const result = runBrowserSelectionStateMachine(page, { ...options, residencyAckId });
+  const acknowledged = page.evaluate(browserSelectionResidencyAckTask, {
+    residencyAckId,
+    timeoutMs: SELECTION_RESIDENCY_ACK_TIMEOUT_MS
+  }).then((armed) => {
+    if (armed !== true) throw new Error("SELECTION_RESIDENCY_ACK_FAILED");
+  });
+  const armed = Promise.race([
+    acknowledged,
+    result.then(
+      () => new Promise<void>(() => undefined),
+      (error: unknown) => Promise.reject(error)
+    )
+  ]);
+  return Object.freeze({ armed, result });
 }
 
 function elapsedSince(startedAt: number): number {

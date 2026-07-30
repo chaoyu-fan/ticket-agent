@@ -221,8 +221,17 @@ export class LocalRunner {
       await emit("FAILED", message);
       return result(message);
     }
-    if (safetyPolicy.requireLiveReady && !adapter.liveReady) {
-      const message = `LIVE_ADAPTER_NOT_READY:${request.plan.platform}:use mock or dry-run until reviewed`;
+    if (
+      safetyPolicy.requireLiveReady &&
+      (
+        !adapter.liveReady ||
+        !adapter.fastPathReady ||
+        adapter.fastPathContractDigest === undefined ||
+        adapter.fastPathContract === undefined ||
+        !/^sha256:[0-9a-f]{64}$/u.test(adapter.fastPathContractDigest)
+      )
+    ) {
+      const message = `LIVE_FAST_PATH_NOT_READY:${request.plan.platform}:use rehearsal until the reviewed contract is bound`;
       await emit("FAILED", message);
       return result(message);
     }

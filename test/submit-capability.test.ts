@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   InProcessSubmitCapabilityConsumer,
   SUBMIT_CAPABILITY_MAX_LIFETIME_MS,
+  buildAttendeeSelectionFingerprint,
   canonicalOfficialOrigin,
   createSubmitCapabilityNonce,
+  digestRunnerSessionSecret,
   issueSubmitCapability,
   type SubmitCapabilityAttempt,
   type SubmitCapabilityBinding,
@@ -19,6 +21,10 @@ const ISSUED_AT_MS = Date.UTC(2026, 6, 30, 1, 50, 0);
 const EARLIEST_SUBMIT_AT_MS = ISSUED_AT_MS + 10 * 60 * 1_000;
 const EXPIRES_AT_MS = ISSUED_AT_MS + 20 * 60 * 1_000;
 const NONCE = Buffer.alloc(32, 7).toString("base64url");
+const RUNNER_SESSION_SECRET = new Uint8Array(Buffer.alloc(32, 8));
+const OTHER_RUNNER_SESSION_SECRET = new Uint8Array(Buffer.alloc(32, 9));
+const RUNNER_SESSION_DIGEST = digestRunnerSessionSecret(RUNNER_SESSION_SECRET);
+const FAST_PATH_CONTRACT_DIGEST = `sha256:${"a".repeat(64)}` as const;
 const ATTENDEE_REF_A = parseAttendeeRef("attendee:v1:550e8400-e29b-41d4-a716-446655440000");
 const ATTENDEE_REF_B = parseAttendeeRef("attendee:v1:d9428888-122b-4c26-9f8b-6f2f1175e1f4");
 const ATTENDEE_AUDIT = buildAttendeeRefAudit([ATTENDEE_REF_A, ATTENDEE_REF_B]);
@@ -26,20 +32,29 @@ const OTHER_ATTENDEE_AUDIT = buildAttendeeRefAudit([
   parseAttendeeRef("attendee:v1:00000000-0000-4000-8000-000000000001"),
   parseAttendeeRef("attendee:v1:00000000-0000-4000-8000-000000000002")
 ]);
+const ATTENDEE_SELECTION_FINGERPRINT = buildAttendeeSelectionFingerprint(RUNNER_SESSION_SECRET, [
+  JSON.stringify([ATTENDEE_REF_A, "local-display-a"]),
+  JSON.stringify([ATTENDEE_REF_B, "local-display-b"])
+]);
 
 function binding(overrides: Partial<SubmitCapabilityBinding> = {}): SubmitCapabilityBinding {
   return {
     runId: "run-20260730-001",
     planId: "plan-20260730-001",
+    deliveryId: "delivery-20260730-001",
+    runnerSessionDigest: RUNNER_SESSION_DIGEST,
     platform: "damai",
     canonicalEventKey: "show-2026-shanghai",
     officialOrigin: "https://detail.damai.cn",
+    finalOfficialOrigin: "https://buy.damai.cn",
+    fastPathContractDigest: FAST_PATH_CONTRACT_DIGEST,
     eventId: "1067493715985",
     eventTitle: "测试演出 上海站",
     quantity: 2,
     requireAdjacent: true,
     attendeeRefCount: ATTENDEE_AUDIT.count,
     attendeeRefFingerprint: ATTENDEE_AUDIT.fingerprint,
+    attendeeSelectionFingerprint: ATTENDEE_SELECTION_FINGERPRINT,
     sessionPreferences: [
       { label: "2026-08-08 周六 19:30", priority: 10 },
       { label: "2026-08-09 周日 19:30", priority: 20 }
@@ -85,15 +100,20 @@ function attempt(overrides: Partial<SubmitCapabilityAttempt> = {}): SubmitCapabi
   return {
     runId: "run-20260730-001",
     planId: "plan-20260730-001",
+    deliveryId: "delivery-20260730-001",
     platform: "damai",
     canonicalEventKey: "show-2026-shanghai",
     officialOrigin: "https://detail.damai.cn",
+    finalOfficialOrigin: "https://buy.damai.cn",
+    fastPathContractDigest: FAST_PATH_CONTRACT_DIGEST,
     eventId: "1067493715985",
     eventTitle: "测试演出 上海站",
     quantity: 2,
     requireAdjacent: true,
+    adjacentVerified: true,
     attendeeRefCount: ATTENDEE_AUDIT.count,
     attendeeRefFingerprint: ATTENDEE_AUDIT.fingerprint,
+    attendeeSelectionFingerprint: ATTENDEE_SELECTION_FINGERPRINT,
     selectedSession: "2026-08-08 周六 19:30",
     selectedSessionPriority: 10,
     selectedTier: "看台 580 元",
@@ -126,15 +146,20 @@ test("capability signs every approved event and selection bound without sensitiv
 
   assert.equal(claims.runId, "run-20260730-001");
   assert.equal(claims.planId, "plan-20260730-001");
+  assert.equal(claims.deliveryId, "delivery-20260730-001");
+  assert.equal(claims.runnerSessionDigest, RUNNER_SESSION_DIGEST);
   assert.equal(claims.platform, "damai");
   assert.equal(claims.canonicalEventKey, "show-2026-shanghai");
   assert.equal(claims.officialOrigin, "https://detail.damai.cn");
+  assert.equal(claims.finalOfficialOrigin, "https://buy.damai.cn");
+  assert.equal(claims.fastPathContractDigest, FAST_PATH_CONTRACT_DIGEST);
   assert.equal(claims.eventId, "1067493715985");
   assert.equal(claims.eventTitle, "测试演出 上海站");
   assert.equal(claims.quantity, 2);
   assert.equal(claims.requireAdjacent, true);
   assert.equal(claims.attendeeRefCount, 2);
   assert.equal(claims.attendeeRefFingerprint, ATTENDEE_AUDIT.fingerprint);
+  assert.equal(claims.attendeeSelectionFingerprint, ATTENDEE_SELECTION_FINGERPRINT);
   assert.deepEqual(claims.sessionPreferences.map(({ label, priority }) => ({ label, priority })), [
     { label: "2026-08-08 周六 19:30", priority: 10 },
     { label: "2026-08-09 周日 19:30", priority: 20 }
@@ -320,8 +345,13 @@ test("issuance rejects weak keys, overlong lifetimes, malformed nonce, and non-c
 
 test("prepared capability consumes once with no T0 secret or external I/O", () => {
   const envelope = issue();
+  const wrongSession = controlledConsumer();
+  expectCode(
+    () => wrongSession.consumer.prepare(envelope, SECRET, OTHER_RUNNER_SESSION_SECRET),
+    "SUBMIT_CAPABILITY_RUNNER_SESSION_MISMATCH"
+  );
   const first = controlledConsumer();
-  const prepared = first.consumer.prepare(envelope, SECRET);
+  const prepared = first.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET);
   first.setNow(EARLIEST_SUBMIT_AT_MS);
   const claims = first.consumer.consume(prepared, attempt());
   assert.match(claims.nonce, /^[A-Za-z0-9_-]{43}$/u);
@@ -331,14 +361,14 @@ test("prepared capability consumes once with no T0 secret or external I/O", () =
   );
   const second = controlledConsumer(EARLIEST_SUBMIT_AT_MS + 1);
   expectCode(
-    () => second.consumer.prepare(envelope, SECRET),
+    () => second.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET),
     "SUBMIT_CAPABILITY_REPLAYED"
   );
 });
 
 test("signed earliest-submit gate requires both wall and anchored monotonic time", () => {
   const beforeGate = controlledConsumer();
-  const preparedBeforeGate = beforeGate.consumer.prepare(issue(), SECRET);
+  const preparedBeforeGate = beforeGate.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   beforeGate.setNow(EARLIEST_SUBMIT_AT_MS - 1);
   expectCode(
     () => beforeGate.consumer.consume(preparedBeforeGate, attempt()),
@@ -350,7 +380,7 @@ test("signed earliest-submit gate requires both wall and anchored monotonic time
   );
 
   const wallJump = controlledConsumer();
-  const preparedWallJump = wallJump.consumer.prepare(issue(), SECRET);
+  const preparedWallJump = wallJump.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   wallJump.setWallOnly(EARLIEST_SUBMIT_AT_MS);
   expectCode(
     () => wallJump.consumer.consume(preparedWallJump, attempt()),
@@ -364,7 +394,7 @@ test("signed earliest-submit gate requires both wall and anchored monotonic time
 
 test("concurrent local consumers yield exactly one winner", async () => {
   const clock = controlledConsumer();
-  const prepared = clock.consumer.prepare(issue(), SECRET);
+  const prepared = clock.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   const outcomes = await Promise.allSettled([
     Promise.resolve().then(() => {
       clock.setNow(EARLIEST_SUBMIT_AT_MS);
@@ -382,15 +412,19 @@ test("all event binding mismatches fail and burn the one-shot capability", () =>
   const mutations: Partial<SubmitCapabilityAttempt>[] = [
     { runId: "run-other" },
     { planId: "plan-other" },
+    { deliveryId: "delivery-other" },
     { platform: "maoyan" },
     { canonicalEventKey: "other-event" },
     { officialOrigin: "https://www.damai.cn" },
+    { finalOfficialOrigin: "https://www.damai.cn" },
+    { fastPathContractDigest: `sha256:${"b".repeat(64)}` },
     { eventId: "other-id" },
     { eventTitle: "其他演出" },
     { quantity: 1 },
     { requireAdjacent: false },
     { attendeeRefCount: 1 },
-    { attendeeRefFingerprint: OTHER_ATTENDEE_AUDIT.fingerprint }
+    { attendeeRefFingerprint: OTHER_ATTENDEE_AUDIT.fingerprint },
+    { attendeeSelectionFingerprint: `hmac-sha256:${"b".repeat(64)}` }
   ];
 
   for (const [index, mutation] of mutations.entries()) {
@@ -402,7 +436,7 @@ test("all event binding mismatches fail and burn the one-shot capability", () =>
       nonce: uniqueNonce
     });
     const clock = controlledConsumer();
-    const prepared = clock.consumer.prepare(envelope, SECRET);
+    const prepared = clock.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET);
     clock.setNow(EARLIEST_SUBMIT_AT_MS);
     expectCode(
       () => clock.consumer.consume(prepared, attempt(mutation)),
@@ -417,6 +451,7 @@ test("all event binding mismatches fail and burn the one-shot capability", () =>
 
 test("unapproved session/tier or priority and excessive/invalid price fail and burn", () => {
   const cases: Array<{ mutation: Partial<SubmitCapabilityAttempt>; code: string }> = [
+    { mutation: { adjacentVerified: false }, code: "SUBMIT_CAPABILITY_ADJACENCY_NOT_VERIFIED" },
     { mutation: { selectedSession: "未批准场次" }, code: "SUBMIT_CAPABILITY_SELECTION_MISMATCH" },
     { mutation: { selectedSessionPriority: 20 }, code: "SUBMIT_CAPABILITY_SELECTION_MISMATCH" },
     { mutation: { selectedTier: "未批准票档" }, code: "SUBMIT_CAPABILITY_SELECTION_MISMATCH" },
@@ -441,7 +476,7 @@ test("unapproved session/tier or priority and excessive/invalid price fail and b
       nonce: Buffer.alloc(32, index + 30).toString("base64url")
     });
     const clock = controlledConsumer();
-    const prepared = clock.consumer.prepare(envelope, SECRET);
+    const prepared = clock.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET);
     clock.setNow(EARLIEST_SUBMIT_AT_MS);
     expectCode(() => clock.consumer.consume(prepared, attempt(entry.mutation)), entry.code);
     expectCode(() => clock.consumer.consume(prepared, attempt()), "SUBMIT_CAPABILITY_REPLAYED");
@@ -451,12 +486,12 @@ test("unapproved session/tier or priority and excessive/invalid price fail and b
 test("capability is rechecked for expiry and future clock movement at T0", () => {
   const futureClock = controlledConsumer(ISSUED_AT_MS - 1);
   expectCode(
-    () => futureClock.consumer.prepare(issue(), SECRET),
+    () => futureClock.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET),
     "SUBMIT_CAPABILITY_FUTURE_ISSUED"
   );
 
   const expiredClock = controlledConsumer();
-  const expiredPrepared = expiredClock.consumer.prepare(issue(), SECRET);
+  const expiredPrepared = expiredClock.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   expiredClock.setNow(EXPIRES_AT_MS);
   expectCode(
     () => expiredClock.consumer.consume(expiredPrepared, attempt()),
@@ -468,7 +503,7 @@ test("capability is rechecked for expiry and future clock movement at T0", () =>
   );
 
   const rollbackClock = controlledConsumer(EARLIEST_SUBMIT_AT_MS + 100);
-  const rollbackPrepared = rollbackClock.consumer.prepare(issue(), SECRET);
+  const rollbackPrepared = rollbackClock.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   rollbackClock.setNow(EARLIEST_SUBMIT_AT_MS + 99);
   expectCode(
     () => rollbackClock.consumer.consume(rollbackPrepared, attempt()),
@@ -484,16 +519,16 @@ test("capability is rechecked for expiry and future clock movement at T0", () =>
 test("process-wide nonce tombstones cannot be bypassed by a second consumer instance", () => {
   const envelope = issue();
   const first = controlledConsumer();
-  const prepared = first.consumer.prepare(envelope, SECRET);
+  const prepared = first.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET);
   first.setNow(EARLIEST_SUBMIT_AT_MS);
   first.consumer.consume(prepared, attempt());
   const second = controlledConsumer(EARLIEST_SUBMIT_AT_MS + 1);
-  expectCode(() => second.consumer.prepare(envelope, SECRET), "SUBMIT_CAPABILITY_REPLAYED");
+  expectCode(() => second.consumer.prepare(envelope, SECRET, RUNNER_SESSION_SECRET), "SUBMIT_CAPABILITY_REPLAYED");
 });
 
 test("a forged prepared object is never accepted", () => {
   const clock = controlledConsumer();
-  const genuine = clock.consumer.prepare(issue(), SECRET);
+  const genuine = clock.consumer.prepare(issue(), SECRET, RUNNER_SESSION_SECRET);
   const forged = { claims: genuine.claims };
   const consumer = controlledConsumer().consumer;
   expectCode(

@@ -2,3 +2,7 @@ export * from "./types.js";
 export * from "./safety.js";
 export * from "./browser.js";
 export * from "./executor.js";
+export * from "./browser-selection-state-machine.js";
+export * from "./fast-path-contract.js";
+export * from "./armed-fast-path.js";
+export * from "./live-fast-path.js";

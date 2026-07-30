@@ -24,9 +24,11 @@ p50/p95/p99 实测。官方库存、排队顺序、平台服务器响应、网�
 1. 启动可见 Chrome，确认专用 profile、登录状态、活动 URL、活动 ID 和标题。
 2. 从 macOS Keychain 把 opaque `attendeeRefs` 解析为仅存在于进程内存的页面匹配值。
 3. 固化场次顺序、票档顺序、数量、连座要求和最高总价。
-4. 编译并验证选择器，预热页面、DNS/TLS 连接和 JavaScript 运行环境。
-5. 取得该活动唯一购买锁，并准备有期限、单次消费的本地提交能力。
-6. 检查系统自动校时、网络稳定性、电源和休眠设置。
+4. 编译并验证版本化 selector/evidence contract，预热页面、DNS/TLS 连接和 JavaScript 运行环境。
+5. 在页面内安装 resident `MutationObserver`、fallback、timeout 与取消注册，并等待明确 armed ACK。
+6. armed ACK 后只向 controller 领取一次 capability；controller 在同一 SQLite 事务中烧毁 delivery、
+   获取 sticky purchase lock 并把 run 转入 `PREWARM`。Mac 随即完成 HMAC `prepare()` 和 prepared ACK。
+7. 清零 capability key 与 runner-session buffer，并检查系统自动校时、网络稳定性、电源和休眠设置。
 
 ## 热路径：T0 后
 
@@ -49,7 +51,8 @@ p50/p95/p99 实测。官方库存、排队顺序、平台服务器响应、网�
 
 ## 浏览器内驻留状态机基础模块
 
-`src/runner/browser-selection-state-machine.ts` 已提供一个独立、尚未接入实盘适配器的基础模块。
+`src/runner/browser-selection-state-machine.ts` 已提供 production lifecycle 会调用的驻留基础模块；大麦
+实盘仍因缺少已审核 contract 而保持关闭。
 正常完成路径只跨越一次 `page.evaluate`：同一个浏览器任务安装 `MutationObserver`，等待公开 DOM，
 依次完成场次、`PREFERRED_ORDER` 票档、数量和观演人选择，再在同一任务中重新验证活动、所选票档
 可见价格、数量、观演人数、连座证据、唯一总价和预算。任务不读取 `body.innerText`，不刷新、不导航、
@@ -61,7 +64,9 @@ mutation 时使用 16 ms 的一帧级本地 DOM fallback，不产生网络请求
 不选择、不刷新，也不重新跨越 Node 边界；队列消失后才继续。CAPTCHA、登录失效和售罄即使与队列
 同时出现也仍立即阻断。活动标题或 ID 尚未渲染时只等待且保持零动作，出现多份证据或任一身份不匹配
 则立即阻断；任务仍受调用方 timeout、取消信号和页面导航销毁约束。驻留 timeout 的硬上限为 30 分钟，
-用于覆盖 T-10 预热到 capability 到期的有界窗口，而不是无限等待。该模式尚未接入 production runner。
+用于覆盖 T-10 预热到 capability 到期的有界窗口，而不是无限等待。`startBrowserSelectionStateMachine()`
+现在会额外返回 `armed` 与 `result`：只有浏览器确认 observer 已安装，production lifecycle 才能领取
+一次性 capability；ACK 失败保持零提交。
 
 该模块要求 contract 明确包含 CAPTCHA、登录失效、售罄和官方队列四类阻断选择器。正常模式仅接受
 与 `platform` 对应的官方 HTTPS host；测试假点击仅允许 HTTPS `.test`，或带明确临时端口的
@@ -78,14 +83,18 @@ Damai adapter 调用：
 4. 场次、票档、数量 summary、连座标记、唯一总价及整数分属性；
 5. CAPTCHA、登录、售罄、官方队列以及所有不可逆操作控件的选择器。
 
-在这些选择器通过真实页面只读校准和无提交演练前，状态机保持独立，`DamaiAdapter.liveReady` 继续为
-`false`。
+在这些选择器通过真实页面只读校准和无提交演练前，`DamaiAdapter.liveReady` 与
+`DamaiAdapter.fastPathReady` 都继续为 `false`，contract 与 digest 也必须为空。
 
-最终不可逆点击不能直接复用状态机中的 `HTMLElement.click()`：该事件为 `isTrusted=false`。生产候选
-应让驻留任务返回固定证据，由 Node 消费 capability 后，通过精确 ElementHandle 的非 force
-actionability click 派发可信输入，并在第二个最小任务中重新核对完整绑定。隔离的可信点击原语与
-脱离/遮挡/disabled 回归门已经实现，但尚未接入生产状态机或大麦适配器；Mac 演练还必须测量动画、
-页面替换和价格变化，不能用约 1-3 ms 的坐标/CDP 点击换取误点风险。
+最终不可逆点击不会复用状态机中的 `HTMLElement.click()`：该事件为 `isTrusted=false`。
+`ArmedFastPath` 现在接收已驻留任务，Node 同步先烧毁 capability，再用一个最小 `evaluateHandle` 任务
+复核活动、场次、票档、数量、观演人、连座、总价、阻断态和已有订单证据；它返回唯一精确 submit
+ElementHandle，并安装捕获阶段的一次复核门。随后只调用一次 `force:false`、`scroll:"none"` 的可信
+actionability click。点击异常一律记为 `OUTCOME_UNKNOWN`，不重试。handle 获取前价格变化会在最终
+证据复核处阻断；handle 获取后、可信 click 前证据变化会被 capture guard 拒绝并明确记为
+`ZERO_CLICK_BLOCKED`。handle 脱离、被遮挡或 disabled 也都验证为零 DOM click，但 Playwright click
+结果按不确定处理，不能据此把结果误报成“确定未提交”。该链路已接入 `--live` 专用 lifecycle，但
+没有大麦真实 contract 时仍不可启动；不能用约 1-3 ms 的坐标/CDP 点击换取误点风险。
 
 ## 当前基线
 
@@ -125,20 +134,58 @@ npm run --silent benchmark:trusted-click > trusted-click-performance.json
 ```
 
 它对精确 `ElementHandle` 使用 `force: false` 的 actionability click，固定验证 500 轮均为一次
-`isTrusted=true` click，并验证 handle 脱离、目标被遮挡和 disabled 时全部零点击。服务器开发机首轮
-p50/p95/p99 约为 31.70/33.27/41.09 ms，通过 p95 <= 75 ms、p99 <= 100 ms 的门。该数值不能直接与
-状态机数字相加后宣称真实端到端性能：生产证据交接尚未接线，真实页面 actionability、渲染、导航、
-官方网络和队列都未包含，必须在实际执行的 Mac 上重跑并分阶段测量。
+`isTrusted=true` click，并验证 handle 脱离、目标被遮挡和 disabled 时全部零 DOM click。服务器开发机
+首轮 p50/p95/p99 约为 31.70/33.27/41.09 ms，通过 p95 <= 75 ms、p99 <= 100 ms 的门。这个独立基准
+只隔离可信点击原语；生产候选的证据交接已经由 `ArmedFastPath` 实现并由下一个基准覆盖，不能把两个
+独立基准数字相加后宣称真实端到端性能。真实页面 actionability、渲染、导航、官方网络和队列仍未
+包含，必须在实际执行的 Mac 上重跑并分阶段测量。
+
+完整已武装链路的合成 Chrome 基准为：
+
+```bash
+npm run --silent benchmark:armed-fast-path > armed-fast-path-performance.json
+```
+
+它固定使用合成 `https://buy.damai.cn/__ticket_agent_armed_fast_path_benchmark_v1__` 地址，但所有请求都由
+Playwright 本地 route fulfill；任何其他网络请求立即 abort，且使用临时无 profile context。基准执行
+50 次预热、500 次采样，覆盖 resident 选择结果、同步 consume、最终完整证据复核与一次
+`isTrusted=true` ElementHandle click。报告包含六组指标：
+
+- `browserSelectionLatencyMs`：resident 状态机报告的浏览器选择耗时；
+- `hotPathLatencyMs`：resident selection 已返回固定证据后才开始，到最终 guard 结果回读结束；它不是
+  完整 T0 端到端指标；
+- `consumeLatencyMs`：进程内一次性 capability 同步消费；
+- `finalEvidenceLatencyMs`：最终证据复核、精确 handle 获取和 capture guard 安装；
+- `trustedClickLatencyMs`：非 force actionability click 及其结果；
+- `t0ToTrustedClickLatencyMs`：使用同一个浏览器单调时钟，从合成开售 DOM 放行到可信 submit click
+  进入页面 handler；这是该合成基准中的完整 T0→click 指标。
+
+六项固定检查为：`exactTargetBound`（无关可信点击不能消耗 guard，按钮子节点的 click 仍精确绑定
+submit）、`priceChanged`（最终 handle 获取前价格变化）、`evidenceChangedAfterHandle`（handle 获取后、
+可信 click 前证据变化）、`detachedHandle`、`obscuredTarget` 和 `disabledTarget`。`priceChanged` 与
+`evidenceChangedAfterHandle` 都明确返回 `ZERO_CLICK_BLOCKED`；后三类保持零 DOM click，但
+Playwright click 结果按不确定处理。报告使用封闭 schema，校验器会从 raw samples 重算
+p50/p95/p99 并拒绝字段、样本数、fault 结果和
+percentile 篡改；CLI 拒绝所有参数，因此不能传入真实活动 URL。
+
+2026-07-31 当前实现于服务器开发机的 500 次结果为：browser selection p50/p95/p99
+`8.73/10.16/11.42 ms`，selection 返回后的 hot path `38.75/40.22/45.51 ms`，同步 consume
+`0.036/0.049/0.061 ms`，最终证据复核 `3.81/4.34/5.30 ms`，可信点击
+`34.06/35.47/39.45 ms`，浏览器 T0→可信点击 `39.10/40.30/45.70 ms`。门槛为 hot path p95/p99
+不超过 `100/125 ms`、可信点击 p95/p99 不超过 `75/100 ms`、T0→可信点击 p95/p99 不超过
+`125/150 ms`。这些数字仍不包含真实大麦 DOM、跨文档导航、官方网络、队列、库存或风控；最终结论
+只能来自目标 Mac 连续三轮实测。
 
 ## 上线前性能门
 
-1. Mac 的 loopback 简化基准、真实驻留状态机基准和可信 ElementHandle 点击基准均连续三轮各
-   500 次通过，并保留严格脱敏 JSON。
+1. Mac 的 loopback 简化基准、真实驻留状态机基准、可信 ElementHandle 点击基准和完整 armed
+   fast-path 基准均连续三轮各 500 次通过，并保留严格脱敏 JSON。
 2. 官方页面只读校准能够稳定识别开售、官方队列、登录异常、验证码和售罄状态。
-3. 无提交能力的确认页演练能够正确选择并复核活动、场次、票档、数量、观演人和总价，并确认页面
-   是否接受合成点击；最终提交必须另行实现和演练可信 ElementHandle 输入，不能由假 sink 基准推断。
+3. 无提交能力的确认页演练能够正确选择并复核活动、场次、票档、数量、观演人和总价；随后用同一
+   脱敏 contract 验证唯一 submit 控件、遮罩、动画、节点替换与 actionability，但不在热门活动上做试单。
 4. 真实页面状态机逐阶段记录 p50/p95/p99，确认没有文件、Keychain、SQLite、控制器 HTTP 或整页文本
    扫描进入 T0 热路径。
 5. 价格变化、页面改版、重定向、重复运行和未知点击结果都保持零重试或人工接管。
 
-在第 2、3 项完成且用户明确最高总价前，大麦 `liveReady` 必须继续为 `false`。
+在第 2、3 项完成且用户明确最高总价、场次顺序和票档顺序前，大麦 `liveReady` 与 `fastPathReady`
+必须继续为 `false`。

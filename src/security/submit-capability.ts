@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 /**
@@ -8,11 +8,12 @@ import { performance } from "node:perf_hooks";
  * canonical, and contain no identity, cookie, or payment material.
  */
 
-export const SUBMIT_CAPABILITY_VERSION = 1 as const;
+export const SUBMIT_CAPABILITY_VERSION = 2 as const;
 export const SUBMIT_CAPABILITY_PURPOSE = "ticket-agent.submit-order" as const;
 /** Keep a pre-warmed capability short lived even if a caller supplies a bad TTL. */
 export const SUBMIT_CAPABILITY_MAX_LIFETIME_MS = 30 * 60 * 1_000;
 export const SUBMIT_CAPABILITY_MIN_SECRET_BYTES = 32;
+export const RUNNER_SESSION_SECRET_BYTES = 32;
 const SUBMIT_CAPABILITY_MAX_BODY_CHARS = 64 * 1024;
 
 export type CapabilityPlatform = "damai" | "maoyan";
@@ -26,10 +27,18 @@ export interface SubmitCapabilityPreference {
 export interface SubmitCapabilityBinding {
   readonly runId: string;
   readonly planId: string;
+  /** Durable, at-most-once controller delivery identifier. */
+  readonly deliveryId: string;
+  /** Digest of an ephemeral runner-session secret that is never persisted. */
+  readonly runnerSessionDigest: `sha256:${string}`;
   readonly platform: CapabilityPlatform;
   readonly canonicalEventKey: string;
   /** Canonical HTTPS origin, for example https://detail.damai.cn. */
   readonly officialOrigin: string;
+  /** Exact canonical HTTPS origin on which the final submit may be dispatched. */
+  readonly finalOfficialOrigin: string;
+  /** Digest of the reviewed, versioned fast-path selector/evidence contract. */
+  readonly fastPathContractDigest: `sha256:${string}`;
   readonly eventId: string;
   readonly eventTitle: string;
   readonly quantity: number;
@@ -37,6 +46,8 @@ export interface SubmitCapabilityBinding {
   /** Non-sensitive audit binding only; raw refs and resolved labels are forbidden. */
   readonly attendeeRefCount: number;
   readonly attendeeRefFingerprint: `sha256:${string}`;
+  /** Session-keyed digest binding opaque refs to resolved labels and DOM evidence. */
+  readonly attendeeSelectionFingerprint: `hmac-sha256:${string}`;
   /** Preferences are sorted by ascending priority and are immutable once signed. */
   readonly sessionPreferences: readonly SubmitCapabilityPreference[];
   readonly tierPreferences: readonly SubmitCapabilityPreference[];
@@ -79,15 +90,20 @@ export interface SubmitCapabilityIssueOptions {
 export interface SubmitCapabilityAttempt {
   readonly runId: string;
   readonly planId: string;
+  readonly deliveryId: string;
   readonly platform: CapabilityPlatform;
   readonly canonicalEventKey: string;
   readonly officialOrigin: string;
+  readonly finalOfficialOrigin: string;
+  readonly fastPathContractDigest: `sha256:${string}`;
   readonly eventId: string;
   readonly eventTitle: string;
   readonly quantity: number;
   readonly requireAdjacent: boolean;
+  readonly adjacentVerified: boolean;
   readonly attendeeRefCount: number;
   readonly attendeeRefFingerprint: `sha256:${string}`;
+  readonly attendeeSelectionFingerprint: `hmac-sha256:${string}`;
   readonly selectedSession: string;
   readonly selectedSessionPriority: number;
   readonly selectedTier: string;
@@ -112,7 +128,9 @@ export type SubmitCapabilityErrorCode =
   | "SUBMIT_CAPABILITY_EXPIRED"
   | "SUBMIT_CAPABILITY_REPLAYED"
   | "SUBMIT_CAPABILITY_NOT_PREPARED"
+  | "SUBMIT_CAPABILITY_RUNNER_SESSION_MISMATCH"
   | "SUBMIT_CAPABILITY_BINDING_MISMATCH"
+  | "SUBMIT_CAPABILITY_ADJACENCY_NOT_VERIFIED"
   | "SUBMIT_CAPABILITY_SELECTION_MISMATCH"
   | "SUBMIT_CAPABILITY_TIER_UNIT_PRICE_LIMIT_EXCEEDED"
   | "SUBMIT_CAPABILITY_PRICE_INCONSISTENT"
@@ -129,6 +147,7 @@ export class SubmitCapabilityError extends Error {
 }
 
 export type SubmitCapabilitySecret = string | Uint8Array;
+export type RunnerSessionSecret = Uint8Array;
 
 function fail(code: SubmitCapabilityErrorCode): never {
   throw new SubmitCapabilityError(code);
@@ -147,6 +166,60 @@ function secretBytes(secret: SubmitCapabilitySecret): Buffer {
     fail("SUBMIT_CAPABILITY_SECRET_TOO_SHORT");
   }
   return bytes;
+}
+
+function runnerSessionSecretBytes(secret: unknown): Buffer {
+  if (!(secret instanceof Uint8Array) || secret.byteLength !== RUNNER_SESSION_SECRET_BYTES) {
+    fail("SUBMIT_CAPABILITY_RUNNER_SESSION_MISMATCH");
+  }
+  return Buffer.from(secret);
+}
+
+/** Generate an ephemeral runner-session secret. It must never enter SQLite or logs. */
+export function createRunnerSessionSecret(): RunnerSessionSecret {
+  return new Uint8Array(randomBytes(RUNNER_SESSION_SECRET_BYTES));
+}
+
+/** Domain-separated digest stored in a durable grant and signed capability. */
+export function digestRunnerSessionSecret(secret: RunnerSessionSecret): `sha256:${string}` {
+  const bytes = runnerSessionSecretBytes(secret);
+  try {
+    return `sha256:${createHash("sha256")
+      .update("ticket-agent/runner-session/v1\u0000", "utf8")
+      .update(bytes)
+      .digest("hex")}`;
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+/**
+ * Bind opaque attendee refs to their T-10 Keychain labels without placing
+ * either value in claims. Callers must supply canonical, ordered pair strings
+ * and wipe the labels after the run.
+ */
+export function buildAttendeeSelectionFingerprint(
+  secret: RunnerSessionSecret,
+  canonicalPairs: readonly string[]
+): `hmac-sha256:${string}` {
+  if (!Array.isArray(canonicalPairs) || canonicalPairs.length < 1 || canonicalPairs.length > 6) {
+    fail("SUBMIT_CAPABILITY_INPUT_INVALID");
+  }
+  const values = canonicalPairs.map((value) => {
+    assertText(value, 1_000);
+    return value;
+  });
+  if (new Set(values).size !== values.length) fail("SUBMIT_CAPABILITY_INPUT_INVALID");
+  const bytes = runnerSessionSecretBytes(secret);
+  try {
+    const digest = createHmac("sha256", bytes)
+      .update("ticket-agent/attendee-selection/v1\u0000", "utf8")
+      .update(JSON.stringify(values), "utf8")
+      .digest("hex");
+    return `hmac-sha256:${digest}`;
+  } finally {
+    bytes.fill(0);
+  }
 }
 
 function assertClock(nowMs: number): void {
@@ -286,14 +359,19 @@ function validateBinding(binding: SubmitCapabilityBinding): SubmitCapabilityBind
     "canonicalEventKey",
     "attendeeRefCount",
     "attendeeRefFingerprint",
+    "attendeeSelectionFingerprint",
+    "deliveryId",
     "eventId",
     "eventTitle",
+    "fastPathContractDigest",
+    "finalOfficialOrigin",
     "maxTotalFen",
     "officialOrigin",
     "planId",
     "platform",
     "quantity",
     "requireAdjacent",
+    "runnerSessionDigest",
     "runId",
     "sessionPreferences",
     "tierPreferences"
@@ -301,9 +379,17 @@ function validateBinding(binding: SubmitCapabilityBinding): SubmitCapabilityBind
   if (Object.keys(binding).sort().join(",") !== expectedKeys) fail("SUBMIT_CAPABILITY_INPUT_INVALID");
   assertText(binding.runId, 200);
   assertText(binding.planId, 200);
+  assertText(binding.deliveryId, 200);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(binding.runnerSessionDigest)) {
+    fail("SUBMIT_CAPABILITY_INPUT_INVALID");
+  }
   if (binding.platform !== "damai" && binding.platform !== "maoyan") fail("SUBMIT_CAPABILITY_INPUT_INVALID");
   assertText(binding.canonicalEventKey, 200);
   const officialOrigin = canonicalOfficialOrigin(binding.platform, binding.officialOrigin);
+  const finalOfficialOrigin = canonicalOfficialOrigin(binding.platform, binding.finalOfficialOrigin);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(binding.fastPathContractDigest)) {
+    fail("SUBMIT_CAPABILITY_INPUT_INVALID");
+  }
   assertText(binding.eventId, 200);
   assertText(binding.eventTitle, 500);
   if (!Number.isSafeInteger(binding.quantity) || binding.quantity < 1 || binding.quantity > 6) {
@@ -316,21 +402,29 @@ function validateBinding(binding: SubmitCapabilityBinding): SubmitCapabilityBind
   if (!/^sha256:[0-9a-f]{64}$/u.test(binding.attendeeRefFingerprint)) {
     fail("SUBMIT_CAPABILITY_INPUT_INVALID");
   }
+  if (!/^hmac-sha256:[0-9a-f]{64}$/u.test(binding.attendeeSelectionFingerprint)) {
+    fail("SUBMIT_CAPABILITY_INPUT_INVALID");
+  }
   const sessionPreferences = assertPreferenceArray(binding.sessionPreferences, "sessionPreferences").map((item) => Object.freeze({ ...item }));
   const tierPreferences = assertPreferenceArray(binding.tierPreferences, "tierPreferences").map((item) => Object.freeze({ ...item }));
   if (!Number.isSafeInteger(binding.maxTotalFen) || binding.maxTotalFen < 0) fail("SUBMIT_CAPABILITY_INPUT_INVALID");
   return {
     runId: binding.runId,
     planId: binding.planId,
+    deliveryId: binding.deliveryId,
+    runnerSessionDigest: binding.runnerSessionDigest,
     platform: binding.platform,
     canonicalEventKey: binding.canonicalEventKey,
     officialOrigin,
+    finalOfficialOrigin,
+    fastPathContractDigest: binding.fastPathContractDigest,
     eventId: binding.eventId,
     eventTitle: binding.eventTitle,
     quantity: binding.quantity,
     requireAdjacent: binding.requireAdjacent,
     attendeeRefCount: binding.attendeeRefCount,
     attendeeRefFingerprint: binding.attendeeRefFingerprint,
+    attendeeSelectionFingerprint: binding.attendeeSelectionFingerprint,
     sessionPreferences: Object.freeze(sessionPreferences),
     tierPreferences: Object.freeze(tierPreferences),
     maxTotalFen: binding.maxTotalFen
@@ -382,15 +476,20 @@ function canonicalClaimsJson(claims: SubmitCapabilityClaims): string {
     purpose: claims.purpose,
     runId: claims.runId,
     planId: claims.planId,
+    deliveryId: claims.deliveryId,
+    runnerSessionDigest: claims.runnerSessionDigest,
     platform: claims.platform,
     canonicalEventKey: claims.canonicalEventKey,
     officialOrigin: claims.officialOrigin,
+    finalOfficialOrigin: claims.finalOfficialOrigin,
+    fastPathContractDigest: claims.fastPathContractDigest,
     eventId: claims.eventId,
     eventTitle: claims.eventTitle,
     quantity: claims.quantity,
     requireAdjacent: claims.requireAdjacent,
     attendeeRefCount: claims.attendeeRefCount,
     attendeeRefFingerprint: claims.attendeeRefFingerprint,
+    attendeeSelectionFingerprint: claims.attendeeSelectionFingerprint,
     sessionPreferences: claims.sessionPreferences,
     tierPreferences: claims.tierPreferences,
     maxTotalFen: claims.maxTotalFen,
@@ -404,7 +503,7 @@ function canonicalClaimsJson(claims: SubmitCapabilityClaims): string {
 function hmacFor(body: string, secret: SubmitCapabilitySecret): Buffer {
   const key = secretBytes(secret);
   try {
-    return createHmac("sha256", key).update("ticket-agent/submit-capability/v1\u0000", "utf8").update(body, "utf8").digest();
+    return createHmac("sha256", key).update("ticket-agent/submit-capability/v2\u0000", "utf8").update(body, "utf8").digest();
   } finally {
     // Do not retain a copied Uint8Array key beyond the HMAC operation.
     key.fill(0);
@@ -455,10 +554,14 @@ function parseAndValidateClaims(body: string, nowMs: number): SubmitCapabilityCl
     "canonicalEventKey",
     "attendeeRefCount",
     "attendeeRefFingerprint",
+    "attendeeSelectionFingerprint",
+    "deliveryId",
     "eventId",
     "eventTitle",
     "earliestSubmitAtMs",
     "expiresAtMs",
+    "fastPathContractDigest",
+    "finalOfficialOrigin",
     "issuedAtMs",
     "maxTotalFen",
     "nonce",
@@ -468,6 +571,7 @@ function parseAndValidateClaims(body: string, nowMs: number): SubmitCapabilityCl
     "purpose",
     "quantity",
     "requireAdjacent",
+    "runnerSessionDigest",
     "runId",
     "sessionPreferences",
     "tierPreferences",
@@ -494,15 +598,20 @@ function parseAndValidateClaims(body: string, nowMs: number): SubmitCapabilityCl
   const binding = validateBinding({
     runId: value.runId as string,
     planId: value.planId as string,
+    deliveryId: value.deliveryId as string,
+    runnerSessionDigest: value.runnerSessionDigest as `sha256:${string}`,
     platform: value.platform as CapabilityPlatform,
     canonicalEventKey: value.canonicalEventKey as string,
     officialOrigin: value.officialOrigin as string,
+    finalOfficialOrigin: value.finalOfficialOrigin as string,
+    fastPathContractDigest: value.fastPathContractDigest as `sha256:${string}`,
     eventId: value.eventId as string,
     eventTitle: value.eventTitle as string,
     quantity: value.quantity as number,
     requireAdjacent: value.requireAdjacent as boolean,
     attendeeRefCount: value.attendeeRefCount as number,
     attendeeRefFingerprint: value.attendeeRefFingerprint as `sha256:${string}`,
+    attendeeSelectionFingerprint: value.attendeeSelectionFingerprint as `hmac-sha256:${string}`,
     sessionPreferences: value.sessionPreferences as SubmitCapabilityPreference[],
     tierPreferences: value.tierPreferences as SubmitCapabilityPreference[],
     maxTotalFen: value.maxTotalFen as number
@@ -562,11 +671,16 @@ function assertAttemptShape(attempt: unknown): asserts attempt is SubmitCapabili
   if (typeof attempt !== "object" || attempt === null || Array.isArray(attempt)) fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   const value = attempt as Record<string, unknown>;
   const expectedKeys = [
+    "adjacentVerified",
     "canonicalEventKey",
     "attendeeRefCount",
     "attendeeRefFingerprint",
+    "attendeeSelectionFingerprint",
+    "deliveryId",
     "eventId",
     "eventTitle",
+    "fastPathContractDigest",
+    "finalOfficialOrigin",
     "observedTotalFen",
     "officialOrigin",
     "planId",
@@ -583,19 +697,31 @@ function assertAttemptShape(attempt: unknown): asserts attempt is SubmitCapabili
   if (Object.keys(value).sort().join(",") !== expectedKeys) fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   assertText(value.runId, 200);
   assertText(value.planId, 200);
+  assertText(value.deliveryId, 200);
   if (value.platform !== "damai" && value.platform !== "maoyan") fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   assertText(value.canonicalEventKey, 200);
   assertText(value.officialOrigin, 300);
+  assertText(value.finalOfficialOrigin, 300);
+  if (typeof value.fastPathContractDigest !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(value.fastPathContractDigest)) {
+    fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
+  }
   assertText(value.eventId, 200);
   assertText(value.eventTitle, 500);
   if (!Number.isSafeInteger(value.quantity) || (value.quantity as number) < 1 || (value.quantity as number) > 6) {
     fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   }
   if (typeof value.requireAdjacent !== "boolean") fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
+  if (typeof value.adjacentVerified !== "boolean") fail("SUBMIT_CAPABILITY_ADJACENCY_NOT_VERIFIED");
   if (!Number.isSafeInteger(value.attendeeRefCount) || (value.attendeeRefCount as number) < 1) {
     fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   }
   if (typeof value.attendeeRefFingerprint !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(value.attendeeRefFingerprint)) {
+    fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
+  }
+  if (
+    typeof value.attendeeSelectionFingerprint !== "string" ||
+    !/^hmac-sha256:[0-9a-f]{64}$/u.test(value.attendeeSelectionFingerprint)
+  ) {
     fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
   }
   assertText(value.selectedSession, 300);
@@ -617,21 +743,28 @@ function assertAttemptShape(attempt: unknown): asserts attempt is SubmitCapabili
 const ATTEMPT_BINDING_FIELDS = Object.freeze([
   "runId",
   "planId",
+  "deliveryId",
   "platform",
   "canonicalEventKey",
   "officialOrigin",
+  "finalOfficialOrigin",
+  "fastPathContractDigest",
   "eventId",
   "eventTitle",
   "quantity",
   "requireAdjacent",
   "attendeeRefCount",
-  "attendeeRefFingerprint"
+  "attendeeRefFingerprint",
+  "attendeeSelectionFingerprint"
 ] as const);
 
 function verifyAttempt(entry: ConsumerEntry, attempt: SubmitCapabilityAttempt): void {
   const { claims } = entry;
   for (const field of ATTEMPT_BINDING_FIELDS) {
     if (claims[field] !== attempt[field]) fail("SUBMIT_CAPABILITY_BINDING_MISMATCH");
+  }
+  if (claims.requireAdjacent && attempt.adjacentVerified !== true) {
+    fail("SUBMIT_CAPABILITY_ADJACENCY_NOT_VERIFIED");
   }
   const sessionLabel = entry.sessionByPriority.get(attempt.selectedSessionPriority);
   const tier = entry.tierByPriority.get(attempt.selectedTierPriority);
@@ -702,11 +835,18 @@ export class InProcessSubmitCapabilityConsumer {
     return nowMs;
   }
 
-  prepare(envelope: unknown, secret: SubmitCapabilitySecret): PreparedSubmitCapability {
+  prepare(
+    envelope: unknown,
+    secret: SubmitCapabilitySecret,
+    runnerSessionSecret: RunnerSessionSecret
+  ): PreparedSubmitCapability {
     const nowMs = this.now();
     const monotonicMs = this.monotonicClock();
     assertMonotonicClock(monotonicMs);
     const claims = verifySubmitCapabilityAt(envelope, secret, nowMs);
+    if (digestRunnerSessionSecret(runnerSessionSecret) !== claims.runnerSessionDigest) {
+      fail("SUBMIT_CAPABILITY_RUNNER_SESSION_MISMATCH");
+    }
     if (processRegisteredNonces.has(claims.nonce)) fail("SUBMIT_CAPABILITY_REPLAYED");
     const handle = Object.freeze({ claims });
     const sessionByPriority = new Map(claims.sessionPreferences.map((item) => [item.priority, item.label] as const));

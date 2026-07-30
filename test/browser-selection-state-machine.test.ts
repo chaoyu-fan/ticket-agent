@@ -7,6 +7,7 @@ import {
   browserSelectionTask,
   MAX_SELECTION_RESIDENCY_MS,
   runBrowserSelectionStateMachine,
+  startBrowserSelectionStateMachine,
   type BrowserSelectionContract,
   type BrowserSelectionPlan
 } from "../src/runner/browser-selection-state-machine.js";
@@ -212,6 +213,7 @@ async function withFakeDom(
   const observerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "MutationObserver");
   const locationDescriptor = Object.getOwnPropertyDescriptor(globalThis, "location");
   const registryDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__ticketAgentSelectionMachines_v1");
+  const residencyDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__ticketAgentSelectionResidency_v1");
   const document = new FakeDocument();
   const location = new FakeLocation();
   Object.defineProperty(globalThis, "document", { configurable: true, value: document });
@@ -224,6 +226,7 @@ async function withFakeDom(
     restoreProperty("MutationObserver", observerDescriptor);
     restoreProperty("location", locationDescriptor);
     restoreProperty("__ticketAgentSelectionMachines_v1", registryDescriptor);
+    restoreProperty("__ticketAgentSelectionResidency_v1", residencyDescriptor);
   }
 }
 
@@ -445,6 +448,50 @@ test("one serialized page task waits, selects first permitted tier, verifies, an
   });
 });
 
+test("resident start acknowledges the installed observer before capability delivery can proceed", async () => {
+  await withFakeDom(async (document, _location, page) => {
+    const fixture = installFixture(document, { sessionInitiallyVisible: false });
+    let settled = false;
+    const resident = startBrowserSelectionStateMachine(page.asPage(), {
+      contract,
+      plan,
+      timeoutMs: 1_000,
+      fallbackIntervalMs: 20,
+      testOnlyFakeSubmit: true
+    });
+    void resident.result.finally(() => { settled = true; });
+
+    await resident.armed;
+    assert.equal(settled, false);
+    assert.equal(document.observers.size, 1);
+    assert.equal(page.inputs.length, 2, "cold-path ACK adds one evaluate before T0");
+    assert.equal(fixture.realSubmit.clickCount, 0);
+
+    document.set(SELECTORS.session, [fixture.session]);
+    const result = await resident.result;
+    assert.equal(result.outcome, "test-clicked", JSON.stringify(result));
+    assert.equal(fixture.realSubmit.clickCount, 0);
+    assert.equal(document.observers.size, 0);
+  });
+});
+
+test("resident start rejects its ACK when the observer cannot be installed", async () => {
+  await withFakeDom(async (document, _location, page) => {
+    installFixture(document);
+    const resident = startBrowserSelectionStateMachine(page.asPage(), {
+      contract: { ...contract, eventTitleSelector: "[" },
+      plan,
+      timeoutMs: 500,
+      testOnlyFakeSubmit: true
+    });
+    await assert.rejects(resident.armed, /SELECTION_RESIDENCY_ACK_FAILED/);
+    const result = await resident.result;
+    assert.equal(result.outcome, "blocked");
+    if (result.outcome === "blocked") assert.equal(result.reason, "CONTRACT_SELECTOR_INVALID");
+    assert.equal(document.observers.size, 0);
+  });
+});
+
 test("immediate abort leaves a pre-registration state-machine task cancelled", async () => {
   const page = new DelayedFirstEvaluatePage();
   await withFakeDom(async (document, _location, runningPage) => {
@@ -528,6 +575,54 @@ test("the serialized browser callback has no full-body text scan or Node closure
     assert.equal(result.outcome, "ready", JSON.stringify(result));
     assert.equal(page.inputs.length, 1);
   });
+});
+
+test("production readiness waits for the reviewed submit control without clicking it", async () => {
+  await withFakeDom(async (document, location, page) => {
+    const fixture = installFixture(document);
+    fixture.realSubmit.innerText = "确认订单";
+    fixture.realSubmit.disabled = true;
+    location.href = "https://buy.damai.cn/order?itemId=event-1";
+    const officialContract: BrowserSelectionContract = {
+      ...contract,
+      allowedOrigins: ["https://buy.damai.cn"]
+    };
+    const running = runBrowserSelectionStateMachine(page.asPage(), {
+      contract: officialContract,
+      plan,
+      timeoutMs: 500,
+      fallbackIntervalMs: 20,
+      submitReadiness: {
+        selector: SELECTORS.submit,
+        allowedLabels: ["确认订单"]
+      }
+    });
+
+    setTimeout(() => {
+      fixture.realSubmit.disabled = false;
+      document.notifySoon();
+    }, 15);
+    const result = await running;
+    assert.equal(result.outcome, "ready", JSON.stringify(result));
+    assert.equal(fixture.realSubmit.clickCount, 0);
+    assert.equal(fixture.sink.clickCount, 0);
+    assert.equal(page.inputs.length, 1);
+  });
+});
+
+test("submit readiness must be part of the immutable forbidden-action contract", async () => {
+  await assert.rejects(
+    () => runBrowserSelectionStateMachine(new InProcessPage().asPage(), {
+      contract,
+      plan,
+      timeoutMs: 500,
+      submitReadiness: {
+        selector: "[data-unreviewed-submit]",
+        allowedLabels: ["确认订单"]
+      }
+    }),
+    /SELECTION_SUBMIT_READINESS_NOT_FORBIDDEN/
+  );
 });
 
 test("a misconfigured evidence selector resolving to body is blocked before any whole-page text is returned", async () => {

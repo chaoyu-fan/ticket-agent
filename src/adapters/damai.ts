@@ -736,6 +736,9 @@ export class DamaiAdapter implements TicketPlatformAdapter {
   readonly platform = "damai" as const;
   readonly implemented = true;
   readonly liveReady = false;
+  readonly fastPathReady = false;
+  readonly fastPathContractDigest = undefined;
+  readonly fastPathContract = undefined;
 
   supportsOfficialUrl(url: URL): boolean {
     return url.protocol === "https:" && isDamaiHost(url.hostname) && !url.username && !url.password && (url.port === "" || url.port === "443");

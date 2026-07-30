@@ -649,7 +649,11 @@ test("Damai atomic submit detects price or URL changes inside evaluate and perfo
 });
 
 test("Damai adapter remains disabled for live execution", () => {
-  assert.equal(new DamaiAdapter().liveReady, false);
+  const adapter = new DamaiAdapter();
+  assert.equal(adapter.liveReady, false);
+  assert.equal(adapter.fastPathReady, false);
+  assert.equal(adapter.fastPathContractDigest, undefined);
+  assert.equal(adapter.fastPathContract, undefined);
 });
 
 function invokeMockRequest(path: string): { body: string; status: number | undefined } {

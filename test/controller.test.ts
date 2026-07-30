@@ -8,10 +8,15 @@ import { test } from "node:test";
 import type { RunnerEvent, RunState, WatchPlanInput } from "../src/core/types.js";
 import { closeController, createControllerHttpServer, listenController } from "../src/controller/http.js";
 import { ControllerError } from "../src/controller/errors.js";
+import { loadControllerServerSecrets } from "../src/controller/server.js";
 import { ControllerStore, eventKeyForPlan } from "../src/controller/store.js";
+import { SubmitCapabilityService } from "../src/controller/submit-capability-service.js";
 
 const ATTENDEE_REF_A = "attendee:v1:550e8400-e29b-41d4-a716-446655440000" as const;
 const ATTENDEE_REF_B = "attendee:v1:d9428888-122b-4c26-9f8b-6f2f1175e1f4" as const;
+const CONTROLLER_TOKEN = "controller-test-token-with-32-bytes-minimum";
+const CAPABILITY_KEY = "controller-capability-key-distinct-and-at-least-32-bytes";
+const CAPABILITY_SALE_AT_MS = Date.parse("2026-08-01T10:00:00+08:00");
 
 function memoryStore(): ControllerStore {
   let nextId = 0;
@@ -19,6 +24,14 @@ function memoryStore(): ControllerStore {
   return new ControllerStore(":memory:", {
     idFactory: () => `id-${++nextId}`,
     now: () => new Date(Date.UTC(2026, 6, 28, 0, 0, tick++)).toISOString()
+  });
+}
+
+function capabilityService(store: ControllerStore): SubmitCapabilityService {
+  return new SubmitCapabilityService(store, CAPABILITY_KEY, {
+    nowMs: () => CAPABILITY_SALE_AT_MS - 5 * 60 * 1_000,
+    deliveryIdFactory: () => "http-delivery-1",
+    nonceFactory: () => Buffer.alloc(32, 31).toString("base64url")
   });
 }
 
@@ -105,6 +118,27 @@ test("plan CRUD applies safe defaults and only drafts are editable/deletable", (
     store.deletePlan(plan.id);
     assert.equal(store.getPlan(plan.id), undefined);
     assert.equal(store.listPlans().length, 0);
+  } finally {
+    store.close();
+  }
+});
+
+test("controller rejects negative or duplicate preference priorities before persistence", () => {
+  const store = memoryStore();
+  try {
+    for (const invalid of [
+      { sessions: [{ label: "首场", priority: -1 }] },
+      { sessions: [{ label: "首场", priority: 10 }, { label: "次场", priority: 10 }] },
+      { tiers: [{ label: "看台", priority: -1 }] },
+      { tiers: [{ label: "看台", priority: 10 }, { label: "内场", priority: 10 }] }
+    ]) {
+      assert.throws(
+        () => store.createPlan({ platform: "damai", ...invalid }),
+        assertControllerCode("PLAN_INVALID")
+      );
+    }
+    assert.equal(store.listPlans().length, 0);
+    assert.equal((store.database.prepare("SELECT COUNT(*) AS count FROM plan_status_audit").get() as { count: number }).count, 0);
   } finally {
     store.close();
   }
@@ -611,12 +645,13 @@ test("arming rejects a paused plan while any prior run remains non-terminal", ()
 
 test("HTTP controller exposes unauthenticated health only and binds loopback", async () => {
   const store = memoryStore();
+  const submitCapabilityService = capabilityService(store);
   assert.throws(
-    () => createControllerHttpServer({ store, token: "too-short" }),
+    () => createControllerHttpServer({ store, token: "too-short", submitCapabilityService }),
     /at least 32 bytes/
   );
-  const token = "controller-test-token-with-32-bytes-minimum";
-  const server = createControllerHttpServer({ store, token });
+  const token = CONTROLLER_TOKEN;
+  const server = createControllerHttpServer({ store, token, submitCapabilityService });
   const address = await listenController(server);
   const baseUrl = `http://${address.host}:${address.port}`;
   try {
@@ -679,6 +714,231 @@ test("HTTP controller exposes unauthenticated health only and binds loopback", a
     assert.equal(confirmed.status, 200);
     const confirmedPayload = (await confirmed.json()) as { run: { state: string } };
     assert.equal(confirmedPayload.run.state, "SUCCESS");
+  } finally {
+    await closeController(server);
+    store.close();
+  }
+});
+
+test("controller server requires a distinct capability signing key", () => {
+  const token = "t".repeat(32);
+  const capabilityKey = "c".repeat(32);
+
+  assert.throws(
+    () => loadControllerServerSecrets({}),
+    /TICKET_AGENT_TOKEN must contain at least 32 bytes/
+  );
+  assert.throws(
+    () => loadControllerServerSecrets({ TICKET_AGENT_TOKEN: token }),
+    /TICKET_AGENT_CAPABILITY_KEY must contain at least 32 bytes/
+  );
+  assert.throws(
+    () => loadControllerServerSecrets({
+      TICKET_AGENT_TOKEN: token,
+      TICKET_AGENT_CAPABILITY_KEY: "short"
+    }),
+    /TICKET_AGENT_CAPABILITY_KEY must contain at least 32 bytes/
+  );
+  assert.throws(
+    () => loadControllerServerSecrets({
+      TICKET_AGENT_TOKEN: token,
+      TICKET_AGENT_CAPABILITY_KEY: token
+    }),
+    /must not reuse TICKET_AGENT_TOKEN/
+  );
+  assert.deepEqual(
+    loadControllerServerSecrets({
+      TICKET_AGENT_TOKEN: token,
+      TICKET_AGENT_CAPABILITY_KEY: capabilityKey
+    }),
+    { token, capabilityKey }
+  );
+});
+
+test("HTTP submit capability lifecycle is strict, authenticated, and at-most-once", async () => {
+  const store = memoryStore();
+  const submitCapabilityService = capabilityService(store);
+  const server = createControllerHttpServer({
+    store,
+    token: CONTROLLER_TOKEN,
+    submitCapabilityService
+  });
+  const address = await listenController(server);
+  const baseUrl = `http://${address.host}:${address.port}`;
+  const headers = {
+    authorization: `Bearer ${CONTROLLER_TOKEN}`,
+    "content-type": "application/json"
+  };
+  const post = (pathname: string, body: unknown): Promise<Response> => fetch(`${baseUrl}${pathname}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
+  const errorCode = async (response: Response): Promise<string> => {
+    const payload = await response.json() as { error?: { code?: unknown } };
+    assert.equal(typeof payload.error?.code, "string");
+    return payload.error!.code as string;
+  };
+
+  try {
+    const armed = store.armPlan(store.createPlan(safePlan({
+      canonicalEventKey: "http-fast-path-show",
+      priceStrategy: "PREFERRED_ORDER",
+      sessions: [{ label: "首场", priority: 10 }],
+      tiers: [{ label: "看台", priority: 10, maxUnitPriceFen: 80_000 }]
+    })).id);
+    const runPath = `/runs/${encodeURIComponent(armed.run.id)}/submit-capability`;
+    const deliveryInput = {
+      runnerSessionDigest: `sha256:${"a".repeat(64)}`,
+      attendeeSelectionFingerprint: `hmac-sha256:${"b".repeat(64)}`,
+      fastPathContractDigest: `sha256:${"c".repeat(64)}`,
+      finalOfficialOrigin: "https://buy.damai.cn"
+    };
+
+    const unauthorized = await fetch(`${baseUrl}${runPath}/deliver`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(deliveryInput)
+    });
+    assert.equal(unauthorized.status, 401);
+
+    const signingKeyIsNotBearer = await fetch(`${baseUrl}${runPath}/deliver`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CAPABILITY_KEY}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(deliveryInput)
+    });
+    assert.equal(signingKeyIsNotBearer.status, 401);
+
+    const wrongMediaType = await fetch(`${baseUrl}${runPath}/deliver`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CONTROLLER_TOKEN}` },
+      body: JSON.stringify(deliveryInput)
+    });
+    assert.equal(wrongMediaType.status, 415);
+    assert.equal(await errorCode(wrongMediaType), "UNSUPPORTED_MEDIA_TYPE");
+
+    const malformedJson = await fetch(`${baseUrl}${runPath}/deliver`, {
+      method: "POST",
+      headers,
+      body: "{"
+    });
+    assert.equal(malformedJson.status, 400);
+    assert.equal(await errorCode(malformedJson), "INVALID_JSON");
+
+    const extraDeliveryField = await post(`${runPath}/deliver`, {
+      ...deliveryInput,
+      unexpected: true
+    });
+    assert.equal(extraDeliveryField.status, 422);
+    assert.equal(await errorCode(extraDeliveryField), "SUBMIT_CAPABILITY_DELIVERY_INVALID");
+
+    const invalidOfficialOrigin = await post(`${runPath}/deliver`, {
+      ...deliveryInput,
+      finalOfficialOrigin: "https://tickets.example.com"
+    });
+    assert.equal(invalidOfficialOrigin.status, 422);
+    assert.equal(await errorCode(invalidOfficialOrigin), "SUBMIT_CAPABILITY_DELIVERY_INVALID");
+
+    const delivered = await post(`${runPath}/deliver`, deliveryInput);
+    assert.equal(delivered.status, 201);
+    assert.equal(delivered.headers.get("cache-control"), "no-store");
+    assert.equal(delivered.headers.get("x-content-type-options"), "nosniff");
+    const deliveredPayload = await delivered.json() as {
+      delivery: { body: string; signature: string };
+      grant: { deliveryId: string; status: string };
+      run: { state: string };
+    };
+    assert.equal(deliveredPayload.grant.deliveryId, "http-delivery-1");
+    assert.equal(deliveredPayload.grant.status, "DELIVERY_CLAIMED");
+    assert.equal(deliveredPayload.run.state, "PREWARM");
+    assert.ok(deliveredPayload.delivery.body.length > 0);
+    assert.ok(deliveredPayload.delivery.signature.length > 0);
+    const deliveredText = JSON.stringify(deliveredPayload);
+    assert.equal(deliveredText.includes(CAPABILITY_KEY), false);
+    assert.equal(deliveredText.includes(CONTROLLER_TOKEN), false);
+
+    const responseLossRetry = await post(`${runPath}/deliver`, deliveryInput);
+    assert.equal(responseLossRetry.status, 409);
+    const retryText = await responseLossRetry.text();
+    assert.equal(JSON.parse(retryText).error.code, "SUBMIT_CAPABILITY_ALREADY_DELIVERED");
+    assert.equal(retryText.includes(deliveredPayload.delivery.body), false);
+    assert.equal(retryText.includes(deliveredPayload.delivery.signature), false);
+
+    const claimedStatus = await fetch(`${baseUrl}${runPath}`, { headers });
+    assert.equal(claimedStatus.status, 200);
+    const claimedStatusPayload = await claimedStatus.json() as { grant: { status: string } };
+    assert.equal(claimedStatusPayload.grant.status, "DELIVERY_CLAIMED");
+
+    const malformedAck = await post(`${runPath}/prepared-ack`, {
+      deliveryId: deliveredPayload.grant.deliveryId,
+      unexpected: true
+    });
+    assert.equal(malformedAck.status, 422);
+    assert.equal(await errorCode(malformedAck), "SUBMIT_CAPABILITY_PREPARED_ACK_INVALID");
+
+    const mismatchedAck = await post(`${runPath}/prepared-ack`, { deliveryId: "wrong-delivery" });
+    assert.equal(mismatchedAck.status, 409);
+    assert.equal(await errorCode(mismatchedAck), "SUBMIT_CAPABILITY_DELIVERY_MISMATCH");
+
+    const prepared = await post(`${runPath}/prepared-ack`, {
+      deliveryId: deliveredPayload.grant.deliveryId
+    });
+    assert.equal(prepared.status, 200);
+    const preparedPayload = await prepared.json() as { grant: { status: string } };
+    assert.equal(preparedPayload.grant.status, "RUNNER_PREPARED");
+    const preparedReplay = await post(`${runPath}/prepared-ack`, {
+      deliveryId: deliveredPayload.grant.deliveryId
+    });
+    assert.equal(preparedReplay.status, 200);
+
+    const submitAttemptPath = `/runs/${encodeURIComponent(armed.run.id)}/submit-attempt`;
+    const malformedAttempt = await post(submitAttemptPath, {
+      deliveryId: deliveredPayload.grant.deliveryId,
+      outcome: "CLICK_RETRY"
+    });
+    assert.equal(malformedAttempt.status, 422);
+    assert.equal(await errorCode(malformedAttempt), "SUBMIT_CAPABILITY_ATTEMPT_INVALID");
+
+    const mismatchedAttempt = await post(submitAttemptPath, {
+      deliveryId: "wrong-delivery",
+      outcome: "ZERO_CLICK_BLOCKED"
+    });
+    assert.equal(mismatchedAttempt.status, 409);
+    assert.equal(await errorCode(mismatchedAttempt), "SUBMIT_CAPABILITY_DELIVERY_MISMATCH");
+
+    const attempted = await post(submitAttemptPath, {
+      deliveryId: deliveredPayload.grant.deliveryId,
+      outcome: "ZERO_CLICK_BLOCKED"
+    });
+    assert.equal(attempted.status, 200);
+    const attemptedPayload = await attempted.json() as { grant: { status: string } };
+    assert.equal(attemptedPayload.grant.status, "ZERO_CLICK_BLOCKED");
+    assert.equal(store.requireRun(armed.run.id).state, "FAILED");
+
+    const attemptReplay = await post(submitAttemptPath, {
+      deliveryId: deliveredPayload.grant.deliveryId,
+      outcome: "ZERO_CLICK_BLOCKED"
+    });
+    assert.equal(attemptReplay.status, 200);
+    const conflictingAttempt = await post(submitAttemptPath, {
+      deliveryId: deliveredPayload.grant.deliveryId,
+      outcome: "CLICK_DISPATCHED"
+    });
+    assert.equal(conflictingAttempt.status, 409);
+    assert.equal(await errorCode(conflictingAttempt), "SUBMIT_CAPABILITY_ATTEMPT_ALREADY_RECORDED");
+
+    const unclaimed = store.armPlan(store.createPlan(safePlan({
+      canonicalEventKey: "http-fast-path-unclaimed"
+    })).id).run;
+    const unclaimedStatus = await fetch(
+      `${baseUrl}/runs/${encodeURIComponent(unclaimed.id)}/submit-capability`,
+      { headers }
+    );
+    assert.equal(unclaimedStatus.status, 404);
+    assert.equal(await errorCode(unclaimedStatus), "SUBMIT_CAPABILITY_GRANT_NOT_FOUND");
   } finally {
     await closeController(server);
     store.close();

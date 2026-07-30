@@ -10,6 +10,9 @@ export class MaoyanAdapter implements TicketPlatformAdapter {
   readonly platform = "maoyan" as const;
   readonly implemented = false;
   readonly liveReady = false;
+  readonly fastPathReady = false;
+  readonly fastPathContractDigest = undefined;
+  readonly fastPathContract = undefined;
 
   supportsOfficialUrl(url: URL): boolean {
     const hostname = url.hostname.toLowerCase().replace(/^www\./, "");

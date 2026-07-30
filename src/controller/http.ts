@@ -3,10 +3,16 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP } from "node:net";
 
 import type { PlanStatus, RunnerEvent, WatchPlanInput } from "../core/types.js";
+import { canonicalOfficialOrigin } from "../security/submit-capability.js";
 import { ControllerError, isControllerError } from "./errors.js";
+import type {
+  ClaimSubmitCapabilityInput,
+  SubmitCapabilityService
+} from "./submit-capability-service.js";
 import {
   ControllerStore,
   type NoOrderReconciliationInput,
+  type SubmitAttemptOutcome,
   type SubmitAuthorizationInput,
   type SuccessConfirmationInput,
   type WatchPlanPatch
@@ -15,6 +21,7 @@ import {
 export interface ControllerHttpOptions {
   store: ControllerStore;
   token: string;
+  submitCapabilityService: SubmitCapabilityService;
   maxBodyBytes?: number;
 }
 
@@ -47,6 +54,20 @@ function authorized(request: IncomingMessage, token: string): boolean {
   return supplied.byteLength === expected.byteLength && timingSafeEqual(supplied, expected);
 }
 
+function requireJsonContentType(request: IncomingMessage): void {
+  const contentType = request.headers["content-type"];
+  if (
+    typeof contentType !== "string" ||
+    !/^\s*application\/json\s*(?:;|$)/iu.test(contentType)
+  ) {
+    throw new ControllerError(
+      "UNSUPPORTED_MEDIA_TYPE",
+      "Request Content-Type must be application/json",
+      415
+    );
+  }
+}
+
 async function readJson(request: IncomingMessage, maxBodyBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
   let received = 0;
@@ -69,6 +90,123 @@ function objectBody(value: unknown): Record<string, unknown> {
     throw new ControllerError("INVALID_BODY", "Request body must be a JSON object", 422);
   }
   return value as Record<string, unknown>;
+}
+
+function exactObjectBody(
+  value: unknown,
+  expectedKeys: readonly string[],
+  code: string,
+  message: string
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ControllerError(code, message, 422);
+  }
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).sort().join(",") !== [...expectedKeys].sort().join(",")) {
+    throw new ControllerError(code, message, 422);
+  }
+  return body;
+}
+
+function deliveryIdFromPreparedAck(value: unknown): string {
+  const body = exactObjectBody(
+    value,
+    ["deliveryId"],
+    "SUBMIT_CAPABILITY_PREPARED_ACK_INVALID",
+    "Prepared acknowledgement must contain only a valid deliveryId"
+  );
+  const deliveryId = body.deliveryId;
+  if (
+    typeof deliveryId !== "string" ||
+    deliveryId.length < 1 ||
+    deliveryId.length > 200 ||
+    deliveryId.trim() !== deliveryId ||
+    /[\u0000-\u001f\u007f]/u.test(deliveryId)
+  ) {
+    throw new ControllerError(
+      "SUBMIT_CAPABILITY_PREPARED_ACK_INVALID",
+      "Prepared acknowledgement must contain only a valid deliveryId",
+      422
+    );
+  }
+  return deliveryId;
+}
+
+function claimSubmitCapabilityBody(value: unknown): ClaimSubmitCapabilityInput {
+  const body = exactObjectBody(
+    value,
+    [
+      "attendeeSelectionFingerprint",
+      "fastPathContractDigest",
+      "finalOfficialOrigin",
+      "runnerSessionDigest"
+    ],
+    "SUBMIT_CAPABILITY_DELIVERY_INVALID",
+    "Capability delivery request fields are invalid"
+  );
+  const runnerSessionDigest = body.runnerSessionDigest;
+  const attendeeSelectionFingerprint = body.attendeeSelectionFingerprint;
+  const fastPathContractDigest = body.fastPathContractDigest;
+  const finalOfficialOrigin = body.finalOfficialOrigin;
+  if (
+    typeof runnerSessionDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(runnerSessionDigest) ||
+    typeof attendeeSelectionFingerprint !== "string" ||
+    !/^hmac-sha256:[0-9a-f]{64}$/u.test(attendeeSelectionFingerprint) ||
+    typeof fastPathContractDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(fastPathContractDigest) ||
+    typeof finalOfficialOrigin !== "string" ||
+    finalOfficialOrigin.length < 1 ||
+    finalOfficialOrigin.length > 300 ||
+    finalOfficialOrigin.trim() !== finalOfficialOrigin ||
+    /[\u0000-\u001f\u007f]/u.test(finalOfficialOrigin)
+  ) {
+    throw new ControllerError(
+      "SUBMIT_CAPABILITY_DELIVERY_INVALID",
+      "Capability delivery request fields are invalid",
+      422
+    );
+  }
+  return {
+    runnerSessionDigest: runnerSessionDigest as `sha256:${string}`,
+    attendeeSelectionFingerprint: attendeeSelectionFingerprint as `hmac-sha256:${string}`,
+    fastPathContractDigest: fastPathContractDigest as `sha256:${string}`,
+    finalOfficialOrigin
+  };
+}
+
+const SUBMIT_ATTEMPT_OUTCOMES = new Set<SubmitAttemptOutcome>([
+  "CLICK_DISPATCHED",
+  "OUTCOME_UNKNOWN",
+  "CONSUME_REJECTED",
+  "ZERO_CLICK_BLOCKED"
+]);
+
+function submitAttemptBody(value: unknown): { deliveryId: string; outcome: SubmitAttemptOutcome } {
+  const body = exactObjectBody(
+    value,
+    ["deliveryId", "outcome"],
+    "SUBMIT_CAPABILITY_ATTEMPT_INVALID",
+    "Submit attempt must contain only a valid deliveryId and outcome"
+  );
+  const deliveryId = body.deliveryId;
+  const outcome = body.outcome;
+  if (
+    typeof deliveryId !== "string" ||
+    deliveryId.length < 1 ||
+    deliveryId.length > 200 ||
+    deliveryId.trim() !== deliveryId ||
+    /[\u0000-\u001f\u007f]/u.test(deliveryId) ||
+    typeof outcome !== "string" ||
+    !SUBMIT_ATTEMPT_OUTCOMES.has(outcome as SubmitAttemptOutcome)
+  ) {
+    throw new ControllerError(
+      "SUBMIT_CAPABILITY_ATTEMPT_INVALID",
+      "Submit attempt must contain only a valid deliveryId and outcome",
+      422
+    );
+  }
+  return { deliveryId, outcome: outcome as SubmitAttemptOutcome };
 }
 
 function routeId(pathname: string, suffix = ""): string | undefined {
@@ -179,6 +317,68 @@ async function handle(options: Required<ControllerHttpOptions>, request: Incomin
     return;
   }
 
+  const deliverCapabilityRunId = runRouteId(url.pathname, "/submit-capability/deliver");
+  if (method === "POST" && deliverCapabilityRunId !== undefined) {
+    requireJsonContentType(request);
+    const body = claimSubmitCapabilityBody(await readJson(request, options.maxBodyBytes));
+    const run = options.store.requireRun(deliverCapabilityRunId);
+    const plan = options.store.requirePlan(run.planId);
+    try {
+      canonicalOfficialOrigin(plan.platform, body.finalOfficialOrigin);
+    } catch {
+      throw new ControllerError(
+        "SUBMIT_CAPABILITY_DELIVERY_INVALID",
+        "finalOfficialOrigin must be a canonical official platform origin",
+        422
+      );
+    }
+    json(
+      response,
+      201,
+      options.submitCapabilityService.claimDelivery(deliverCapabilityRunId, body)
+    );
+    return;
+  }
+
+  const preparedAckRunId = runRouteId(url.pathname, "/submit-capability/prepared-ack");
+  if (method === "POST" && preparedAckRunId !== undefined) {
+    requireJsonContentType(request);
+    const deliveryId = deliveryIdFromPreparedAck(await readJson(request, options.maxBodyBytes));
+    json(response, 200, {
+      grant: options.store.ackSubmitCapabilityPrepared(preparedAckRunId, deliveryId)
+    });
+    return;
+  }
+
+  const submitAttemptRunId = runRouteId(url.pathname, "/submit-attempt");
+  if (method === "POST" && submitAttemptRunId !== undefined) {
+    requireJsonContentType(request);
+    const body = submitAttemptBody(await readJson(request, options.maxBodyBytes));
+    json(response, 200, {
+      grant: options.store.recordSubmitAttemptOutcome(
+        submitAttemptRunId,
+        body.deliveryId,
+        body.outcome
+      )
+    });
+    return;
+  }
+
+  const capabilityGrantRunId = runRouteId(url.pathname, "/submit-capability");
+  if (method === "GET" && capabilityGrantRunId !== undefined) {
+    options.store.requireRun(capabilityGrantRunId);
+    const grant = options.store.getSubmitCapabilityGrant(capabilityGrantRunId);
+    if (grant === undefined) {
+      throw new ControllerError(
+        "SUBMIT_CAPABILITY_GRANT_NOT_FOUND",
+        "No capability grant exists",
+        404
+      );
+    }
+    json(response, 200, { grant });
+    return;
+  }
+
   const approveSubmitRunId = runRouteId(url.pathname, "/approve-submit");
   if (method === "POST" && approveSubmitRunId !== undefined) {
     const body = objectBody(await readJson(request, options.maxBodyBytes));
@@ -233,6 +433,7 @@ export function createControllerHttpServer(options: ControllerHttpOptions): Serv
   const resolved: Required<ControllerHttpOptions> = {
     store: options.store,
     token: options.token,
+    submitCapabilityService: options.submitCapabilityService,
     maxBodyBytes: options.maxBodyBytes ?? 256 * 1024
   };
   return createServer((request, response) => {

@@ -101,6 +101,24 @@ test("运行时计划校验拒绝未知策略和畸形数组而不抛异常", ()
   assert.throws(() => normalizePlan({ platform: "damai", tiers: "not-an-array" } as never), /PLAN_SHAPE_INVALID/);
 });
 
+test("场次和票档优先级必须是非负且组内唯一的整数", () => {
+  for (const invalid of [
+    { sessions: [{ label: "首场", priority: -1 }] },
+    { sessions: [{ label: "首场", priority: 10 }, { label: "次场", priority: 10 }] },
+    { tiers: [{ label: "看台", priority: -1 }] },
+    { tiers: [{ label: "看台", priority: 10 }, { label: "内场", priority: 10 }] }
+  ]) {
+    const validation = validatePlan({ platform: "damai", ...invalid });
+    assert.equal(validation.ok, false);
+    assert.ok(validation.errors.some((error) => /priorities must be/.test(error)));
+  }
+  assert.equal(validatePlan({
+    platform: "damai",
+    sessions: [{ label: "首场", priority: 0 }, { label: "次场", priority: 10 }],
+    tiers: [{ label: "看台", priority: 0 }, { label: "内场", priority: 10 }]
+  }).ok, true);
+});
+
 test("自动提交要求 opaque attendeeRefs 唯一且与票数完全一致", () => {
   const common = {
     platform: "damai" as const,

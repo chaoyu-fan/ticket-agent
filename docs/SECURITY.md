@@ -6,14 +6,17 @@
 
 1. **目标绑定**：初始链接必须匹配计划平台；导航、选择和提交前后都必须再次验证当前页面仍在允许的官方域名或本机 mock 边界内。
 2. **活动绑定**：计划中的活动 ID/标题必须与可见页面一致。跨平台同一活动使用 `canonicalEventKey` 竞争同一购买锁。
-3. **模式隔离**：`dry-run` 零点击；`mock` 只访问 loopback 且永不提交；`live` 必须显式确认、适配器已人工审核并使用可见浏览器。
+3. **模式隔离**：`dry-run` 零点击；`mock` 只访问 loopback 且永不提交；`rehearsal` 无 controller/capability；
+   `live` 必须显式确认、适配器已人工审核并使用可见浏览器，而且 CLI 只能走 resident fast path，代码
+   明确拒绝回退 `LocalRunner`。
 4. **价格不可变**：唯一可见订单总价在 `VERIFY_PRICE` 首次记录后不可覆盖；最终点击前必须再次读取并与快照完全相同，同时不超过总预算和票档单价上限。
 5. **选择可证实**：场次、票档、数量、观演人及连座要求必须有明确选中态或订单摘要证据。缺失、歧义或页面改版时停止。
 6. **一次性提交**：只有控制器在价格快照一致且成功取得活动购买锁后，才能授予一次提交许可；计划的
    带时区 `saleAt` 必须签入最早消费时间，墙钟和单调时钟都越过该门才可消费。最终不可逆操作必须
    使用审核过的可信浏览器输入，点击结果不等于成功；必须看到唯一订单/待支付证据。
 7. **人工确认成功**：普通 runner 事件不能直接写入 `SUCCESS`。完成状态只能由用户核对官方订单后显式确认。
-8. **本地数据**：Chrome profile 留在用户 Mac，live 与 sandbox profile 分离、权限为 `0700` 且单实例运行。SQLite 文件权限为 `0600`。
+8. **单页拓扑**：live lifecycle 只接受专用 persistent context 中的唯一原始页。监听必须在首次快照前安装；恢复标签、popup、新页或原页关闭都会触发 sticky abort，即使额外页随后关闭也不恢复提交。
+9. **本地数据**：Chrome profile 留在用户 Mac，live 与 sandbox profile 分离、权限为 `0700` 且单实例运行。SQLite 文件权限为 `0600`。
 
 ## 真实模式发布门槛
 
@@ -23,11 +26,21 @@
 - 重定向、价格变化、重复执行器、验证码、登录失效和未知提交结果测试全部 fail-closed；
 - 用户显式配置最高总价，且不向项目提供密码、Cookie、身份证号或支付信息。
 
-在满足以上条件前，`liveReady` 必须保持 `false`。
+在满足以上条件前，`liveReady` 与 `fastPathReady` 必须保持 `false`，fast-path contract/digest 也不得
+配置。
 
-浏览器驻留状态机和一次性提交能力当前都是独立基础模块，尚未构成 live 授权链路。正式接线还必须
-完成 controller 的 durable prepared 记录、sticky purchase lock、runner-session 一次性交付，以及
-Mac 上 ref→label→真实选中 DOM 的闭环证明；不能仅凭一个 HMAC token 或 loopback 基准开启 live。
+浏览器驻留 ACK、durable delivery grant、sticky purchase lock、runner-session 绑定、prepared ACK、
+Mac ref→Keychain label→选中 DOM 闭环、同步一次消费、最终证据复核和点击后上报已经接成 live 专用
+授权链路。grant 存在后通用 runner event 不得改写 run；prepared ACK 和 attempt 会在事务内再核对
+`PREWARM` run、`RUNNING` plan、`HELD` lock 及完整绑定。首次 delivery envelope 不持久化且绝不重发；
+ACK 失败零点击，页面拓扑违反会粘滞取消，点击异常不重试。当前剩余的
+上线硬门是大麦真实页面 selector/evidence contract 与 Mac 无提交校准，不能仅凭合成 Chrome 基准开启
+live。
+
+Controller Bearer token 与 `TICKET_AGENT_CAPABILITY_KEY` 必须是两把不同的至少 32 字节 secret，且都
+不得进入日志、SQLite、浏览器、计划或仓库。当前 capability 使用 HMAC：个人 Mac 与 controller 属于
+同一信任域时可接受，但 runner 持有验证 key 理论上也具备签名能力；若未来拆分为不互信设备，应改用
+controller 私钥签名、runner 公钥验证的非对称方案。
 
 ## Chrome profile 锁恢复
 

@@ -1,7 +1,7 @@
-# Loopback 热路径性能基准
+# 本机热路径性能基准
 
-该基准只测本机 Chrome 内的 DOM 放行检测、证据校验和假提交点击。它不能测量、模拟或保证
-官方库存、排队、风控及订单响应速度，也不能作为真实购票成功的证明。
+这些基准只测本机 Chrome 内的 DOM 放行检测、证据校验、隔离假点击或可信点击。它们不能测量、模拟
+或保证官方库存、排队、风控及订单响应速度，也不能作为真实购票成功的证明。
 
 ## 隔离边界
 
@@ -58,8 +58,9 @@ CSP，以及无表单的固定 `type=button` sink。脚本不接受 URL、样本
 
 假 sink 由页内 `HTMLElement.click()` 触发，属于 `isTrusted=false` 的合成点击。它只能测量当前真实
 状态机 callback 的本机下限，不能代表大麦真实提交控件、可信输入事件、页面跳转、订单网络响应、
-库存、队列或风控。是否需要可信输入桥接只能在 Mac 无提交 rehearsal 中另行校准；该基准本身不能
-解除 `liveReady=false`。
+库存、队列或风控。可信输入桥接已经由 `ArmedFastPath` 实现并由后文的完整合成基准覆盖；真实大麦
+页面是否满足 selector、证据和 actionability contract 仍必须在 Mac 无提交 rehearsal 中校准。该
+状态机基准本身不能解除 `liveReady=false`。
 
 ## 可信 ElementHandle 点击的隔离基准
 
@@ -79,5 +80,48 @@ fail-closed 门：精确 handle 已脱离、目标被 overlay 遮挡、目标被
 
 基准只访问随机端口 `127.0.0.1` 上的无表单 fixture，使用临时无登录 context；CLI 不接受 URL、profile
 或采样数参数，浏览器层和 CSP 都禁止外部网络。`force: false`、`noWaitAfter: true`、`scroll: "none"`
-保持固定，也不会回退到坐标、`HTMLElement.click()` 或重新查询替换节点。它证明的是可信点击原语及
-故障门，不包含生产状态机到 submit handle 的证据交接，也不能解除 `liveReady=false`。
+保持固定，也不会回退到坐标、`HTMLElement.click()` 或重新查询替换节点。它只证明可信点击原语及
+故障门；生产状态机到 submit handle 的证据交接由后文的 `ArmedFastPath` 基准另行覆盖，但两者都不能
+解除 `liveReady=false`。
+
+## 完整 ArmedFastPath 合成 Chrome 基准
+
+以下命令把实际 resident selection 实现、同步 capability consume、最终完整 DOM 复核、精确 submit
+handle 交接和一次可信 click 串成同一轮：
+
+```bash
+npm run --silent benchmark:armed-fast-path > armed-fast-path-performance.json
+```
+
+它固定预热 50 次并采样 500 次，报告以下六组 raw samples 与 nearest-rank p50/p95/p99：
+
+- `browserSelectionLatencyMs`：resident 状态机报告的浏览器选择耗时；
+- `hotPathLatencyMs`：resident selection 返回固定证据后才开始，到最终 guard 结果回读结束；它不是
+  完整 T0 端到端指标；
+- `consumeLatencyMs`：本进程一次性 capability 的同步消费耗时；
+- `finalEvidenceLatencyMs`：最终完整证据复核、精确 handle 获取和 capture guard 安装耗时；
+- `trustedClickLatencyMs`：非 force actionability click 及其结果耗时；
+- `t0ToTrustedClickLatencyMs`：使用同一个浏览器单调时钟，从合成开售 DOM 放行到可信 submit click
+  进入页面 handler；这是该基准中的完整 T0→click 指标。
+
+报告 schema 是封闭的；读取报告时会重算所有 percentile，并拒绝额外字段、样本数、iteration、click
+计数、fault check 或 summary 篡改。六项固定检查为：
+
+- `exactTargetBound`：无关可信点击不能消耗 submit guard，按钮子节点的 click 仍绑定到精确 submit；
+- `priceChanged`：最终 handle 获取前总价变化，保持零点击；
+- `evidenceChangedAfterHandle`：handle 获取后、可信 click 前证据或价格变化，capture guard 拒绝并保持
+  零 DOM click；
+- `detachedHandle`、`obscuredTarget`、`disabledTarget`：都保持零 DOM click；Playwright click 结果按
+  不确定处理，不能把它们误写为 Playwright 一定能够证明“未提交”。
+
+固定合成地址虽然位于 `buy.damai.cn`，但唯一 document 由 Playwright route 本地 fulfill；任何其他请求
+立即 abort，临时 context 不使用任何 Chrome profile，CLI 也拒绝所有参数和真实 URL。
+
+服务器开发机 2026-07-31 当前实现的 500 次结果为：browser selection p50/p95/p99
+`8.73/10.16/11.42 ms`，selection 返回后的 hot path `38.75/40.22/45.51 ms`，consume
+`0.036/0.049/0.061 ms`，final evidence `3.81/4.34/5.30 ms`，trusted click
+`34.06/35.47/39.45 ms`，浏览器 T0→trusted click `39.10/40.30/45.70 ms`。固定门为 hot path
+p95/p99 不超过 `100/125 ms`、trusted click p95/p99 不超过 `75/100 ms`、T0→trusted click p95/p99
+不超过 `125/150 ms`。这些数字只证明当前代码的本机合成下限与故障门，不包含真实页面导航、官方
+队列、库存、网络、风控和订单响应，也不能解除 `liveReady=false/fastPathReady=false`；目标 Mac
+必须连续三轮重跑。

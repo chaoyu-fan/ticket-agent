@@ -25,6 +25,7 @@ function validatePreferenceArray(value: unknown, field: "sessions" | "tiers", er
     return;
   }
   const labels = new Set<string>();
+  const priorities = new Set<number>();
   for (const item of value) {
     if (!isRecord(item)) {
       errors.push(`${field} entries must be objects`);
@@ -37,7 +38,13 @@ function validatePreferenceArray(value: unknown, field: "sessions" | "tiers", er
       if (labels.has(key)) errors.push(`${field} labels must be unique`);
       labels.add(key);
     }
-    if (!Number.isSafeInteger(item.priority)) errors.push(`${field} priorities must be integers`);
+    if (!isFiniteNonNegativeInteger(item.priority)) {
+      errors.push(`${field} priorities must be non-negative integers`);
+    } else if (priorities.has(item.priority)) {
+      errors.push(`${field} priorities must be unique`);
+    } else {
+      priorities.add(item.priority);
+    }
     if (field === "tiers" && item.maxUnitPriceFen !== undefined && !isFiniteNonNegativeInteger(item.maxUnitPriceFen)) {
       errors.push("tier maxUnitPriceFen must be a non-negative integer in fen");
     }

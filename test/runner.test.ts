@@ -116,6 +116,9 @@ class FakeDamaiAdapter implements TicketPlatformAdapter {
   readonly platform = "damai" as const;
   readonly implemented = true;
   readonly liveReady: boolean;
+  readonly fastPathReady: boolean;
+  readonly fastPathContractDigest: `sha256:${string}` | undefined;
+  readonly fastPathContract: unknown | undefined;
   navigateCount = 0;
   actionCount = 0;
   submitCount = 0;
@@ -136,6 +139,9 @@ class FakeDamaiAdapter implements TicketPlatformAdapter {
 
   constructor(liveReady = true) {
     this.liveReady = liveReady;
+    this.fastPathReady = liveReady;
+    this.fastPathContractDigest = liveReady ? `sha256:${"a".repeat(64)}` : undefined;
+    this.fastPathContract = liveReady ? Object.freeze({ synthetic: true }) : undefined;
   }
 
   supportsOfficialUrl(url: URL): boolean {
@@ -643,7 +649,7 @@ test("LocalRunner itself rejects a live adapter that has not been reviewed", asy
     mode: "live"
   });
   assert.equal(result.state, "FAILED");
-  assert.match(result.message, /LIVE_ADAPTER_NOT_READY/);
+  assert.match(result.message, /LIVE_FAST_PATH_NOT_READY/);
   assert.equal(adapter.navigateCount, 0);
   assertResultConsistent(result);
 });

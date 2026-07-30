@@ -2,8 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import type { BrowserContext, Page } from "playwright-core";
+
 import { normalizePlan, validatePlan } from "../core/policy.js";
-import type { Platform, RunState, WatchPlan, WatchPlanInput } from "../core/types.js";
+import type { Platform, WatchPlan, WatchPlanInput } from "../core/types.js";
 import { adapterFor } from "../adapters/index.js";
 import { assertAttendeePersistenceBoundary } from "../identity/attendee-ref.js";
 import {
@@ -11,9 +13,11 @@ import {
   type AttendeeResolver
 } from "../identity/attendee-resolver.js";
 import { launchMacChrome } from "./browser.js";
-import { ControllerClient, submitDenial } from "./controller-client.js";
+import { ControllerClient } from "./controller-client.js";
 import { LocalRunner, prewarmDelayMs } from "./executor.js";
-import { runnerSafetyPolicy } from "./safety.js";
+import { digestFastPathContract } from "./fast-path-contract.js";
+import { runLiveFastPathLifecycle } from "./live-fast-path.js";
+import { assertTarget, runnerSafetyPolicy } from "./safety.js";
 import type { RunnerMode } from "./types.js";
 
 type CliMode = RunnerMode | "login-only";
@@ -160,9 +164,15 @@ export function loginOnlyTarget(platform: Platform, targetUrl: string): URL {
   return url;
 }
 
-async function waitForVisibleLoginSession(context: Awaited<ReturnType<typeof launchMacChrome>>): Promise<void> {
+export async function waitForVisibleLoginSession(
+  context: Awaited<ReturnType<typeof launchMacChrome>>
+): Promise<void> {
   await new Promise<void>((resolve) => {
+    let settled = false;
     const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      context.off("close", finish);
       process.off("SIGINT", finish);
       process.off("SIGTERM", finish);
       resolve();
@@ -170,7 +180,27 @@ async function waitForVisibleLoginSession(context: Awaited<ReturnType<typeof lau
     context.once("close", finish);
     process.once("SIGINT", finish);
     process.once("SIGTERM", finish);
+    try {
+      const browser = context.browser();
+      if (context.pages().length === 0 || (browser !== null && !browser.isConnected())) finish();
+    } catch {
+      finish();
+    }
   });
+}
+
+/** Reuse the persistent context's sole page; restored multi-tab sessions fail closed. */
+export async function singleContextPage(
+  context: Pick<BrowserContext, "pages" | "newPage">
+): Promise<Page> {
+  const existing = context.pages();
+  if (existing.length > 1) throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+  const page = existing[0] ?? await context.newPage();
+  const current = context.pages();
+  if (current.length !== 1 || current[0] !== page) {
+    throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+  }
+  return page;
 }
 
 function toWatchPlan(input: WatchPlanInput | WatchPlan): WatchPlan {
@@ -203,8 +233,26 @@ export function assertLiveAdapterReady(mode: RunnerMode, plan: Pick<WatchPlan, "
   if (mode === "rehearsal" && !adapter.implemented) {
     throw new Error(`REHEARSAL_ADAPTER_NOT_READY:${plan.platform}:only an implemented visible-UI adapter may rehearse`);
   }
-  if (runnerSafetyPolicy(mode).requireLiveReady && (!adapter.implemented || !adapter.liveReady)) {
-    throw new Error(`LIVE_ADAPTER_NOT_READY:${plan.platform}:use mock or dry-run until the adapter is reviewed`);
+  if (
+    runnerSafetyPolicy(mode).requireLiveReady &&
+    (
+      !adapter.implemented ||
+      !adapter.liveReady ||
+      !adapter.fastPathReady ||
+      adapter.fastPathContractDigest === undefined ||
+      adapter.fastPathContract === undefined ||
+      !/^sha256:[0-9a-f]{64}$/u.test(adapter.fastPathContractDigest)
+    )
+  ) {
+    throw new Error(
+      `LIVE_FAST_PATH_NOT_READY:${plan.platform}:use rehearsal until the reviewed contract is bound`
+    );
+  }
+  if (
+    runnerSafetyPolicy(mode).requireLiveReady &&
+    digestFastPathContract(adapter.fastPathContract) !== adapter.fastPathContractDigest
+  ) {
+    throw new Error(`LIVE_FAST_PATH_CONTRACT_MISMATCH:${plan.platform}`);
   }
 }
 
@@ -278,6 +326,30 @@ function runnerExitCode(result: Awaited<ReturnType<LocalRunner["run"]>>): number
   return result.state === "FAILED" || result.message.startsWith("RUNNER_FAILED:") ? 1 : 0;
 }
 
+export function localRunnerMode(mode: RunnerMode): Exclude<RunnerMode, "live"> {
+  if (mode === "live") throw new Error("LIVE_LOCAL_RUNNER_FALLBACK_BLOCKED");
+  return mode;
+}
+
+/** Copy the one-run verifier key out of the environment and remove the env entry immediately. */
+export function takeLiveCapabilityKey(environment: NodeJS.ProcessEnv = process.env): Uint8Array {
+  const value = environment.TICKET_AGENT_CAPABILITY_KEY;
+  delete environment.TICKET_AGENT_CAPABILITY_KEY;
+  if (typeof value !== "string") throw new Error("LIVE_CAPABILITY_KEY_REQUIRED");
+  const key = Buffer.from(value, "utf8");
+  const token = Buffer.from(environment.TICKET_AGENT_TOKEN ?? "", "utf8");
+  try {
+    if (key.byteLength < 32) throw new Error("LIVE_CAPABILITY_KEY_INVALID");
+    if (key.byteLength === token.byteLength && key.equals(token)) {
+      throw new Error("LIVE_CAPABILITY_KEY_MUST_DIFFER_FROM_TOKEN");
+    }
+    return new Uint8Array(key);
+  } finally {
+    key.fill(0);
+    token.fill(0);
+  }
+}
+
 /**
  * Resolves labels only for official-page modes and scopes them to one browser
  * operation. Dry-run and mock never invoke the resolver, even if one is
@@ -335,7 +407,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const target = loginOnlyTarget(args.platform!, args.targetUrl!);
       const context = await launchMacChrome({ profileScope: "live" });
       try {
-        const page = context.pages()[0] ?? await context.newPage();
+        const page = await singleContextPage(context);
         await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 30_000 });
         loginOnlyTarget(args.platform!, page.url());
         console.log("LOGIN_ONLY_READY:请在可见浏览器中手动登录；完成后关闭浏览器或按 Ctrl-C。不会执行选票或提交动作。");
@@ -426,51 +498,76 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       }
 
       if (abortController.signal.aborted) return 130;
-      return withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
-        // Keychain resolution has completed before this first browser action.
-        const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(runnerMode).profileScope });
+      if (runnerMode === "live") {
+        if (controller === undefined) throw new Error("LIVE_CONTROLLER_REQUIRED");
+        const adapter = adapterFor(plan.platform);
+        if (adapter.fastPathContract === undefined) {
+          throw new Error(`LIVE_FAST_PATH_NOT_READY:${plan.platform}`);
+        }
+        const target = assertTarget(plan, runnerMode, args.targetUrl ?? plan.officialUrl);
+        if (target === undefined) throw new Error("LIVE_TARGET_REQUIRED");
+        const capabilityKey = takeLiveCapabilityKey();
         try {
-          const page = await context.newPage();
+          return await withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
+            const attendeeLabels = [...runtimePlan.attendeeAliases];
+            const persistedPlan: WatchPlan = { ...runtimePlan, attendeeAliases: [] };
+            const context = await launchMacChrome({ profileScope: "live" });
+            try {
+              const page = await singleContextPage(context);
+              await adapter.navigate(page, target.href);
+              if (await singleContextPage(context) !== page) {
+                throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+              }
+              const result = await runLiveFastPathLifecycle({
+                page,
+                controller,
+                runId,
+                plan: persistedPlan,
+                contract: adapter.fastPathContract,
+                attendeeLabels,
+                capabilityKey,
+                signal: abortController.signal
+              });
+              console.log(JSON.stringify(result, null, 2));
+              if (
+                result.fastPath.outcome === "CLICK_DISPATCHED" ||
+                result.fastPath.outcome === "OUTCOME_UNKNOWN"
+              ) {
+                console.error(
+                  "LIVE_VISIBLE_RECONCILIATION_REQUIRED:请检查订单和支付页面；浏览器会保持打开，完成后关闭窗口或按 Ctrl-C。"
+                );
+                await waitForVisibleLoginSession(context);
+              }
+              return result.reportStatus === "RECORDED" && result.fastPath.outcome === "CLICK_DISPATCHED"
+                ? 0
+                : 1;
+            } finally {
+              attendeeLabels.fill("");
+              await context.close();
+            }
+          });
+        } finally {
+          capabilityKey.fill(0);
+        }
+      }
+
+      const nonLiveMode = localRunnerMode(runnerMode);
+      return withRuntimeAttendeeLabels(nonLiveMode, plan, async (runtimePlan) => {
+        // Keychain resolution has completed before this first browser action.
+        const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(nonLiveMode).profileScope });
+        try {
+          const page = await singleContextPage(context);
           const runner = new LocalRunner({
             page,
             signal: abortController.signal,
-            onEvent: async (event) => {
+            onEvent: (event) => {
               console.error(JSON.stringify(event));
-              await controller?.recordEvent(event);
-            },
-            ...(controller === undefined ? {} : {
-              checkRunActive: async ({ expectedState }: { expectedState: RunState }) => {
-                const loaded = await controller.loadRunPlan(runId);
-                const active = loaded.run.id === runId && loaded.plan.id === plan.id && loaded.run.state === expectedState;
-                return {
-                  active,
-                  ...(active ? {} : { message: `controller state is ${loaded.run.state}` })
-                };
-              },
-              authorizeSubmit: async (input) => {
-                try {
-                  const approvedRun = await controller.approveSubmit(input.runId, input.observedTotalFen);
-                  if (
-                    approvedRun.planId !== input.plan.id ||
-                    approvedRun.observedTotalFen !== input.observedTotalFen
-                  ) {
-                    return {
-                      allowed: false,
-                      state: "HUMAN_TAKEOVER",
-                      message: "Controller approval did not match the armed plan and verified total"
-                    } as const;
-                  }
-                  return { allowed: true, approvedTotalFen: approvedRun.observedTotalFen } as const;
-                } catch (error) {
-                  return submitDenial(error);
-                }
-              }
-            })
+            }
           });
           const result = await runner.run({
             runId,
             plan: runtimePlan,
-            mode: runnerMode,
+            mode: nonLiveMode,
             ...(args.targetUrl === undefined ? {} : { targetUrl: args.targetUrl })
           });
           console.log(JSON.stringify(result, null, 2));

@@ -109,6 +109,17 @@ export interface TicketPlatformAdapter {
   readonly implemented: boolean;
   /** Must remain false until selectors have been reviewed against a real, user-supplied official page. */
   readonly liveReady: boolean;
+  /**
+   * Separate production gate for the resident, capability-bound fast path.
+   * This must never be inferred from `liveReady`: a reversible rehearsal can
+   * be reviewed while the irreversible selector/evidence contract is still
+   * unavailable.
+   */
+  readonly fastPathReady: boolean;
+  /** Digest of the exact reviewed fast-path contract, present only when ready. */
+  readonly fastPathContractDigest: `sha256:${string}` | undefined;
+  /** Reviewed selector/evidence contract; selectors are non-sensitive and versioned by the digest. */
+  readonly fastPathContract: unknown | undefined;
 
   supportsOfficialUrl(url: URL): boolean;
   navigate(page: Page, url: string): Promise<void>;

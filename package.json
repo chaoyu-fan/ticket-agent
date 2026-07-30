@@ -18,6 +18,7 @@
     "benchmark:loopback": "tsc -p tsconfig.json && node scripts/benchmark-loopback.mjs",
     "benchmark:state-machine": "tsc -p tsconfig.json && node scripts/benchmark-state-machine.mjs",
     "benchmark:trusted-click": "tsc -p tsconfig.json && node scripts/benchmark-trusted-click.mjs",
+    "benchmark:armed-fast-path": "tsc -p tsconfig.json && node scripts/benchmark-armed-fast-path.mjs",
     "check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

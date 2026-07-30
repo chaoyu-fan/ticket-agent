@@ -10,8 +10,11 @@
   `examples/damai-iwwf-readonly-plan.json`；真实页面 selector 和确认页尚未审核，
   因此 `liveReady` 继续固定为 `false`。
 - 开售/官方队列等待已改为页面内 `MutationObserver` 主触发；浏览器驻留选择状态机和 T-10
-  一次性提交能力原语也已具备独立测试；精确 ElementHandle 的可信点击及脱离/遮挡/disabled
-  fail-closed 基准已经加入，但这些模块尚未接入大麦 live。隔离性能基准只表示本机理想下限，不能
+  一次性提交能力已经接成 durable controller → Mac runner → resident browser 的完整链路；精确
+  ElementHandle 可信点击、驻留 ACK、响应丢失、精确目标/证据变化/脱离/遮挡/disabled 门，以及
+  常驻期间新页、popup 或原页关闭的粘滞零点击防线均有回归测试。
+  `--live` 只能走该 fast path，不能回退旧 `LocalRunner`。但大麦真实 selector contract 尚未校准，
+  所以 `liveReady=false`、`fastPathReady=false` 仍保持关闭。隔离性能基准只表示本机理想下限，不能
   当作真实端到端购票延迟或成功率。
 - 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。
 - 当前默认值为 1 张、可见允许票档中最低价优先；热门活动的极速配置应改用
@@ -32,6 +35,7 @@ npm run smoke
 npm run --silent benchmark:loopback
 npm run --silent benchmark:state-machine
 npm run --silent benchmark:trusted-click
+npm run --silent benchmark:armed-fast-path
 ```
 
 没有活动链接时，可以进行纯配置检查；它不会启动浏览器或访问网络：
@@ -62,15 +66,20 @@ bash scripts/setup-macos.sh
 
 真实 live/rehearsal 模式和 mock/dry-run 使用两个隔离的 Chrome profile。目录拒绝符号链接、权限限制为 `0700`，并通过原子锁阻止同一 profile 同时运行两个执行器。live 与 rehearsal 都强制显示浏览器，以便验证码或登录时人工接管；rehearsal 在代码层面没有控制器授权和订单提交能力。
 
-本机控制器只监听 loopback，令牌至少 32 字节：
+本机控制器只监听 loopback。Bearer token 与 capability HMAC key 都至少 32 UTF-8 字节，且必须不同：
 
 ```bash
 export TICKET_AGENT_TOKEN="$(openssl rand -hex 32)"
+export TICKET_AGENT_CAPABILITY_KEY="$(openssl rand -hex 32)"
 npm run build
 npm run start:controller
 ```
 
-真实 runner 必须从控制器读取已武装 run，并在最终价格复核后调用专用 `approve-submit`。普通 runner 事件不能伪造 `SUBMIT_ORDER` 或 `SUCCESS`。在大麦适配器完成真实页面审核前，CLI 会拒绝 live 启动。
+Mac runner 需要配置与 controller 相同的 `TICKET_AGENT_CAPABILITY_KEY`，并继续使用 Bearer token 访问
+controller。key 只在 T-10 内存中验证首次交付的 envelope，prepare 后立即清零；不会写入 SQLite、
+日志或浏览器。真实 runner 必须从控制器读取已武装 run，等待浏览器驻留 ACK 后只领取一次 capability，
+prepared ACK 成功后才允许本机消费和可信点击。普通 runner 事件不能伪造 `SUBMIT_ORDER` 或 `SUCCESS`。
+在大麦 adapter 的真实 contract 完成审核前，CLI 会拒绝 live 启动。
 
 详细的 macOS 流程见 [docs/MACOS.md](docs/MACOS.md)，安全约束见 [docs/SECURITY.md](docs/SECURITY.md)。
 

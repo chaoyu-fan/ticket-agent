@@ -23,13 +23,25 @@ npm run --silent benchmark:state-machine > state-machine-performance-3.json
 npm run --silent benchmark:trusted-click > trusted-click-performance-1.json
 npm run --silent benchmark:trusted-click > trusted-click-performance-2.json
 npm run --silent benchmark:trusted-click > trusted-click-performance-3.json
+npm run --silent benchmark:armed-fast-path > armed-fast-path-performance-1.json
+npm run --silent benchmark:armed-fast-path > armed-fast-path-performance-2.json
+npm run --silent benchmark:armed-fast-path > armed-fast-path-performance-3.json
 ```
 
-前三轮是 benchmark-only 的 DOM/假点击下限；中间三轮实际调用驻留状态机，覆盖 DOM mutation、场次、
-票档、数量、合成观演人选择、总价复核和固定假 sink；最后三轮测量精确 ElementHandle 的非 force
-可信点击，并验证脱离、遮挡和 disabled 时零点击。三种基准都只使用临时无登录 Chrome。前两种的
-假点击为 `isTrusted=false`；第三种要求 `isTrusted=true`，但仍没有大麦真实选择器、状态机证据交接、
-网络、队列、风控或订单响应，不能据此宣称真实购票达到相同延迟或解除 `liveReady=false`。
+第一组三轮是 benchmark-only 的 DOM/假点击下限；第二组实际调用驻留状态机，覆盖 DOM mutation、
+场次、票档、数量、合成观演人选择、总价复核和固定假 sink；第三组测量精确 ElementHandle 的非 force
+可信点击，并验证脱离、遮挡和 disabled 时零 DOM click；第四组覆盖完整 resident selection →
+synchronous consume → final evidence → trusted click 链路。armed 报告必须包含六组指标，其中
+`hotPathLatencyMs` 从 resident selection 返回固定证据后才开始；使用同一浏览器单调时钟的
+`t0ToTrustedClickLatencyMs` 才是合成基准中的完整 T0→click 指标。它同时验证精确目标绑定、handle
+获取前价格变化、handle 获取后证据变化、handle 脱离、遮挡和 disabled 六项检查。后三项虽然保持零
+DOM click，但 Playwright click 结果按不确定处理。
+
+armed 基准的固定门为 hot path p95/p99 `100/125 ms`、trusted click p95/p99 `75/100 ms`、
+T0→trusted click p95/p99 `125/150 ms`。四种基准都只使用临时无登录 Chrome，armed 基准的固定合成
+大麦 URL 由本地 route fulfill，其他请求全部 abort。前两种的假点击为 `isTrusted=false`；后两种要求
+`isTrusted=true`，但仍没有大麦真实选择器、网络、队列、库存、风控或订单响应，不能据此宣称真实
+购票达到相同延迟或解除 `liveReady=false/fastPathReady=false`。
 
 不要把日常 Chrome 的目录、其父目录或 `Default` profile 配给执行器；live 与 sandbox profile 也不能相同或互为父子目录。首次使用 live 专用 profile 时，账号登录、实名观演人维护和安全验证都由用户在可见浏览器中完成。
 
@@ -92,9 +104,9 @@ fail-closed；dry-run/mock 永远不读取 Keychain。
 全部非终态 run 会在同一迁移事务中进入 `FAILED`。已有 `HELD` 购买锁不会自动释放，用户必须先核对
 官方订单；随后重新用 opaque refs 登记观演人并创建/武装安全计划。
 
-## 5. 确认页演练（无提交能力）
+## 5. 无身份 selector 校准（无提交能力）
 
-登录完成后，可使用同一个可见 live 专用 profile 演练大麦的场次、票档、数量和观演人选择：
+登录完成后，可使用同一个可见 live 专用 profile 检查活动身份、页面边界和基础 selector：
 
 ```bash
 npm run build
@@ -111,14 +123,37 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 计划至少必须绑定 `officialUrl` 和 `eventId`，且 `--url` 若出现必须与 `officialUrl` 完全相同；校准阶段
 可以暂缺尚未审核的标题，但不得用无活动身份的空计划执行可逆点击。
 
+这里使用的仓库示例是无身份只读校准计划：`attendeeRefs`、`sessions` 和 `tiers` 都为空，且
+`autoSubmitOrder=false`。因此该命令不会读取 Keychain、不会选择观演人，也不能证明指定场次、票档、
+数量、预算和观演人的完整确认页演练已经通过。
+
+完整无提交 rehearsal 必须在 Mac 上另建不进入仓库的私有计划，至少包含用户批准的官方活动
+URL/ID、已核准活动标题、场次顺序、票档顺序、数量、明确 `maxTotalFen`、`PREFERRED_ORDER` 以及与
+数量一致的 opaque `attendeeRefs`；对应的页面可见观演人名称只放在 Keychain 映射中，不能写入计划、
+示例或仓库。
+`autoSubmitOrder` 仍设为 `false`，然后使用该私有计划执行：
+
+```bash
+npm run build
+npm run start:runner -- --rehearsal --confirm-rehearsal \
+  --plan /absolute/path/damai-private-rehearsal-plan.json \
+  --url '与私有计划 officialUrl 完全相同的官方 HTTPS 地址'
+```
+
+只有这项私有计划演练才能校准并复核活动、场次、票档、数量、观演人、总价和 submit readiness；它仍
+没有 controller/capability，也不会提交订单。
+
 ## 6. 获得大麦官方链接后
 
 1. 把官方 HTTPS 活动链接、准确活动标题/ID 和开售时间写入计划。校准计划可先只绑定活动 ID；
    在真实标题 selector 审核通过前不要伪造 `eventTitle`，正式 live 计划必须同时绑定 ID 和标题。
 2. 先用 `dry-run` 做只读页面分析，记录实际可见的场次、票档、总价和页面状态；不提供账号密码、Cookie、身份证或支付信息。
 3. 根据真实页面更新并审核大麦 selector，完成页面改版、验证码、重定向和价格歧义测试。
-4. 用上述 `rehearsal` 模式演练到订单确认页，核对活动、场次、票档、数量、观演人和总价。
-5. 设置明确的 `maxTotalFen`；只有全量回归通过后才允许将大麦 `liveReady` 改为 `true`。
+4. 用第 5 节所述本机私有计划执行完整 `rehearsal`，演练到订单确认页并核对活动、场次、票档、数量、
+   观演人和总价；仓库内无身份示例不能替代这一步。
+5. 设置明确的 `maxTotalFen`、场次优先级和票档优先级；生成版本化 fast-path contract，并确认 adapter
+   中的 contract digest 完全匹配。只有全量回归和 Mac 三轮性能门通过后，才允许同时将大麦
+   `liveReady` 与 `fastPathReady` 改为 `true`。
 
 ## 7. 真实执行时的强制条件
 
@@ -126,10 +161,28 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 - 使用 `--controller-url http://127.0.0.1:4317` 和控制器生成的 `--run-id`；
 - plan 来自控制器，不能用本地文件替换；
 - plan 必须包含带明确时区的 `saleAt`；它同时作为一次性 capability 的签名最早提交时间；
-- 最终可见价格在授权前和授权后都与不可变快照逐分相同；
-- 控制器已取得该活动的唯一购买锁；
-- 点击后只有看到唯一订单号和待支付状态才进入 `PAY_REQUIRED`，支付仍由用户完成。
+- plan 必须显式使用 `PREFERRED_ORDER`，包含非空场次/票档顺序、观演人 refs 和 `maxTotalFen`；
+- adapter 的 `liveReady`、`fastPathReady`、contract 和 contract digest 四者同时通过；
+- 浏览器 resident ACK 成功后，controller 才在首次 capability delivery 事务中取得活动购买锁；
+- 本机 prepare 与 prepared ACK 成功后才允许运行 fast path；最终可见价格必须与 capability 和 DOM
+  证据逐分相同；
+- 点击后保持可见 Chrome 供用户核对订单并支付；`CLICK_DISPATCHED` 不等于购票成功。
 
-距离 `saleAt` 超过 10 分钟时，CLI 协调器保持运行，每 30 秒确认控制器 run 仍为 `SCHEDULED`，但不会打开 live Chrome profile；进入 10 分钟预热窗口后才打开可见页面，并保持页面到开售时间。若进入官方排队页，会在同一页面安装一个 `MutationObserver`，并使用本地 DOM fallback；每 2 秒的控制循环只检查取消和官方域名边界，不刷新、不并发开页，也不绕过队列。Mac 和终端必须保持运行；预热前按 `Ctrl-C` 会保留可重新启动的 `SCHEDULED`，预热后中断则先尝试把 run 记为 `FAILED` 再关闭 profile。
+Controller 与 Mac runner 都需要同一把独立 capability key；它必须与 Bearer token 不同且至少 32
+UTF-8 字节。不要把值写入 shell 脚本、仓库或计划文件。示意配置如下，实际部署应放入权限受限的
+本机环境/Secret 管理：
+
+```bash
+export TICKET_AGENT_TOKEN='至少32字节的controller bearer token'
+export TICKET_AGENT_CAPABILITY_KEY='另一把至少32字节的capability key'
+```
+
+Runner 读取 capability key 后立即从自身环境删除该条目，完成 `prepare()` 后清零内存 buffer。
+
+距离 `saleAt` 超过 10 分钟时，CLI 协调器保持运行，每 30 秒确认控制器 run 仍为 `SCHEDULED`，但不会
+打开 live Chrome profile；进入 10 分钟预热窗口后才打开可见页面。它先等待 resident ACK，再领取
+唯一 capability；领取事务会把 run 从 `SCHEDULED` 转入 `PREWARM`。官方队列可见时，同一 observer
+只等待 DOM 变化，不刷新、不并发开页，也不绕过队列。Mac 和终端必须保持运行；首次 delivery 响应
+丢失、ACK 失败、中断或点击结果未知后都禁止重新领取/重新点击，必须人工核对 durable grant 和官方订单。
 
 若授权后页面或价格变化，执行器停止且购买锁保持，必须由用户检查官方订单历史后才能显式释放。
