@@ -222,6 +222,20 @@ exit "$profile_status"
 runner 事件和错误文本后，可先完全关闭该专用浏览器再重试一次；若再次出现，按原错误回传并停止，不要删除
 未知归属的 profile lock，也不要自动重试购票。
 
+若第一次 dry-run 关闭了页面，可做一次不接触默认 profile 的 A/B 重试，以排除 Chrome 恢复页或旧 profile 状态：
+
+```bash
+tmp_profile="$(mktemp -d /private/tmp/ticket-agent-sandbox-probe.XXXXXX)"
+chmod 700 "$tmp_profile"
+TICKET_AGENT_SANDBOX_PROFILE="$tmp_profile" \
+  npm run start:runner -- --dry-run \
+  --plan examples/damai-iwwf-readonly-plan.json
+```
+
+这只创建一个没有账号状态的临时 sandbox profile，不迁移、不删除默认 profile，也不改变任何 live 设置。若全新
+profile 成功，记录为默认 profile/Chrome 恢复状态 blocker；若仍出现相同错误，保留完整错误文本并停止，等待代码级
+生命周期修复，仍不得执行 `rehearsal` 或 `--live`。
+
 ### E. 必须保持的禁止项
 
 - 不得把大麦 `liveReady` 或 `fastPathReady` 改为 `true`；猫眼也继续 fail-closed。
