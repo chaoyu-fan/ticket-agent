@@ -194,25 +194,33 @@ runner 执行后只核对已实际创建的 profile 权限；`NOT_CREATED` 不�
 ```bash
 set -e
 check_profile_mode() {
-  local label="$1" path="$2" mode
-  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+  # In zsh, `path` is tied to PATH; do not use it as a local variable.
+  local label="$1" profile_dir="$2" mode
+  if [ -L "$profile_dir" ] || { [ -e "$profile_dir" ] && [ ! -d "$profile_dir" ]; }; then
     echo "$label: FAIL"
     return 1
   fi
-  if [ ! -e "$path" ]; then
+  if [ ! -e "$profile_dir" ]; then
     echo "$label: NOT_CREATED"
     return 0
   fi
-  mode="$(stat -f '%OLp' "$path")" || { echo "$label: FAIL"; return 1; }
+  mode="$(/usr/bin/stat -f '%OLp' "$profile_dir")" || { echo "$label: FAIL"; return 1; }
   [ "$mode" = 700 ] || { echo "$label: FAIL(mode=$mode)"; return 1; }
   echo "$label: 700"
 }
-check_profile_mode sandbox "${TICKET_AGENT_SANDBOX_PROFILE:-$HOME/Library/Application Support/TicketAgent/SandboxChromeProfile}"
-check_profile_mode live "${TICKET_AGENT_PROFILE:-$HOME/Library/Application Support/TicketAgent/ChromeProfile}"
+profile_status=0
+check_profile_mode sandbox "${TICKET_AGENT_SANDBOX_PROFILE:-$HOME/Library/Application Support/TicketAgent/SandboxChromeProfile}" || profile_status=1
+check_profile_mode live "${TICKET_AGENT_PROFILE:-$HOME/Library/Application Support/TicketAgent/ChromeProfile}" || profile_status=1
 git status --short
+exit "$profile_status"
 ```
 
 凡已创建的 profile，mode 必须为 `700`；最终 `git status --short` 必须为空。
+
+如果 `dry-run` 在 `PREWARM` 后出现 `RUNNER_FAILED:...Target page, context or browser has been closed`，
+这只是安全失败，不代表页面校准成功：不要继续 `rehearsal` 或 `--live`。确认不是手动关闭专用 Chrome，保留完整
+runner 事件和错误文本后，可先完全关闭该专用浏览器再重试一次；若再次出现，按原错误回传并停止，不要删除
+未知归属的 profile lock，也不要自动重试购票。
 
 ### E. 必须保持的禁止项
 
