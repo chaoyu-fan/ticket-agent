@@ -12,7 +12,7 @@ import {
   MacOsKeychainAttendeeResolver,
   type AttendeeResolver
 } from "../identity/attendee-resolver.js";
-import { launchMacChrome } from "./browser.js";
+import { initializeSingleContextPage, launchMacChrome } from "./browser.js";
 import { ControllerClient } from "./controller-client.js";
 import { LocalRunner, prewarmDelayMs } from "./executor.js";
 import { digestFastPathContract } from "./fast-path-contract.js";
@@ -189,15 +189,30 @@ export async function waitForVisibleLoginSession(
   });
 }
 
-/** Reuse the persistent context's sole page; restored multi-tab sessions fail closed. */
+type VisibleContextWait = (context: Awaited<ReturnType<typeof launchMacChrome>>) => Promise<void>;
+
+/** Keeps an unknown live-profile page topology visible until the user has reviewed it. */
+export async function waitForProfileReviewIfRequired(
+  context: Awaited<ReturnType<typeof launchMacChrome>>,
+  error: unknown,
+  wait: VisibleContextWait = waitForVisibleLoginSession,
+  notify: (message: string) => void = (message) => console.error(message)
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message !== "RESTORED_PAGE_REVIEW_REQUIRED") return;
+  notify(
+    `PROFILE_REVIEW_REQUIRED:${message}:live profile 页面保持打开；请人工核对后关闭 TicketAgent 浏览器或按 Ctrl-C。`
+  );
+  await wait(context);
+}
+
+/** Pure topology assertion: never creates a replacement page after navigation. */
 export async function singleContextPage(
-  context: Pick<BrowserContext, "pages" | "newPage">
+  context: Pick<BrowserContext, "pages">
 ): Promise<Page> {
   const existing = context.pages();
-  if (existing.length > 1) throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
-  const page = existing[0] ?? await context.newPage();
-  const current = context.pages();
-  if (current.length !== 1 || current[0] !== page) {
+  const page = existing[0];
+  if (existing.length !== 1 || page === undefined || page.isClosed()) {
     throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
   }
   return page;
@@ -322,8 +337,12 @@ export async function waitForPrewarmWindow(
   }
 }
 
-function runnerExitCode(result: Awaited<ReturnType<LocalRunner["run"]>>): number {
-  return result.state === "FAILED" || result.message.startsWith("RUNNER_FAILED:") ? 1 : 0;
+export function runnerExitCode(result: Awaited<ReturnType<LocalRunner["run"]>>): number {
+  return result.state === "FAILED" ||
+    result.message.startsWith("RUNNER_FAILED:") ||
+    result.message.includes("BROWSER_CONTEXT_CLOSED:")
+    ? 1
+    : 0;
 }
 
 export function localRunnerMode(mode: RunnerMode): Exclude<RunnerMode, "live"> {
@@ -407,7 +426,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const target = loginOnlyTarget(args.platform!, args.targetUrl!);
       const context = await launchMacChrome({ profileScope: "live" });
       try {
-        const page = await singleContextPage(context);
+        // Human-only login does not mutate or close restored tabs. The new
+        // page is the only page this mode navigates automatically.
+        const page = await context.newPage();
         await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 30_000 });
         loginOnlyTarget(args.platform!, page.url());
         console.log("LOGIN_ONLY_READY:请在可见浏览器中手动登录；完成后关闭浏览器或按 Ctrl-C。不会执行选票或提交动作。");
@@ -506,57 +527,70 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         }
         const target = assertTarget(plan, runnerMode, args.targetUrl ?? plan.officialUrl);
         if (target === undefined) throw new Error("LIVE_TARGET_REQUIRED");
+        // Remove the capability key from the environment before Chrome can
+        // inherit it. A profile review wipes the in-memory copy before waiting,
+        // and attendee labels are not resolved until topology preflight passes.
         const capabilityKey = takeLiveCapabilityKey();
         try {
-          return await withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
-            const attendeeLabels = [...runtimePlan.attendeeAliases];
-            const persistedPlan: WatchPlan = { ...runtimePlan, attendeeAliases: [] };
-            const context = await launchMacChrome({ profileScope: "live" });
-            try {
-              const page = await singleContextPage(context);
-              await adapter.navigate(page, target.href);
-              if (await singleContextPage(context) !== page) {
-                throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
-              }
-              const result = await runLiveFastPathLifecycle({
-                page,
-                controller,
-                runId,
-                plan: persistedPlan,
-                contract: adapter.fastPathContract,
-                attendeeLabels,
-                capabilityKey,
-                signal: abortController.signal
-              });
-              console.log(JSON.stringify(result, null, 2));
-              if (
-                result.fastPath.outcome === "CLICK_DISPATCHED" ||
-                result.fastPath.outcome === "OUTCOME_UNKNOWN"
-              ) {
-                console.error(
-                  "LIVE_VISIBLE_RECONCILIATION_REQUIRED:请检查订单和支付页面；浏览器会保持打开，完成后关闭窗口或按 Ctrl-C。"
-                );
-                await waitForVisibleLoginSession(context);
-              }
-              return result.reportStatus === "RECORDED" && result.fastPath.outcome === "CLICK_DISPATCHED"
-                ? 0
-                : 1;
-            } finally {
-              attendeeLabels.fill("");
-              await context.close();
+          const context = await launchMacChrome({ profileScope: "live" });
+          try {
+            const page = await initializeSingleContextPage(context);
+            await adapter.navigate(page, target.href);
+            if (await singleContextPage(context) !== page) {
+              throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
             }
-          });
+            const result = await withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
+              const attendeeLabels = [...runtimePlan.attendeeAliases];
+              const persistedPlan: WatchPlan = { ...runtimePlan, attendeeAliases: [] };
+              try {
+                return await runLiveFastPathLifecycle({
+                  page,
+                  controller,
+                  runId,
+                  plan: persistedPlan,
+                  contract: adapter.fastPathContract,
+                  attendeeLabels,
+                  capabilityKey,
+                  signal: abortController.signal
+                });
+              } finally {
+                attendeeLabels.fill("");
+              }
+            });
+            console.log(JSON.stringify(result, null, 2));
+            if (
+              result.fastPath.outcome === "CLICK_DISPATCHED" ||
+              result.fastPath.outcome === "OUTCOME_UNKNOWN"
+            ) {
+              console.error(
+                "LIVE_VISIBLE_RECONCILIATION_REQUIRED:请检查订单和支付页面；浏览器会保持打开，完成后关闭窗口或按 Ctrl-C。"
+              );
+              await waitForVisibleLoginSession(context);
+            }
+            return result.reportStatus === "RECORDED" && result.fastPath.outcome === "CLICK_DISPATCHED"
+              ? 0
+              : 1;
+          } catch (error) {
+            capabilityKey.fill(0);
+            await waitForProfileReviewIfRequired(context, error);
+            throw error;
+          } finally {
+            await context.close();
+          }
         } finally {
           capabilityKey.fill(0);
         }
       }
 
       const nonLiveMode = localRunnerMode(runnerMode);
-      return withRuntimeAttendeeLabels(nonLiveMode, plan, async (runtimePlan) => {
-        // Keychain resolution has completed before this first browser action.
-        const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(nonLiveMode).profileScope });
-        try {
-          const page = await singleContextPage(context);
+      // The profile topology is checked before Keychain resolution so a
+      // restored-page review cannot retain attendee labels in process memory.
+      const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(nonLiveMode).profileScope });
+      try {
+        const page = await initializeSingleContextPage(context, {
+          allowNonEmptyRestored: nonLiveMode === "dry-run" || nonLiveMode === "mock"
+        });
+        return await withRuntimeAttendeeLabels(nonLiveMode, plan, async (runtimePlan) => {
           const runner = new LocalRunner({
             page,
             signal: abortController.signal,
@@ -572,10 +606,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           });
           console.log(JSON.stringify(result, null, 2));
           return runnerExitCode(result);
-        } finally {
-          await context.close();
+        });
+      } catch (error) {
+        if (nonLiveMode === "rehearsal") {
+          await waitForProfileReviewIfRequired(context, error);
         }
-      });
+        throw error;
+      } finally {
+        await context.close();
+      }
     } finally {
       process.off("SIGINT", abortRun);
       process.off("SIGTERM", abortRun);

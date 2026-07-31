@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import type { FileHandle } from "node:fs/promises";
-import type { BrowserContext, BrowserType } from "playwright-core";
+import type { BrowserContext, BrowserType, Page } from "playwright-core";
 
 type PersistentContextOptions = NonNullable<Parameters<BrowserType["launchPersistentContext"]>[1]>;
 
@@ -32,6 +32,59 @@ export interface ProfileLock {
   release(): Promise<void>;
 }
 
+export interface InitializeSingleContextPageOptions {
+  /** Only a no-submit sandbox may discard a non-empty restored page. */
+  allowNonEmptyRestored?: boolean;
+}
+
+/**
+ * Replaces a persistent context's sole restored/startup page with a fresh page
+ * before any official navigation or capability delivery. Profile storage and
+ * login cookies remain in the context; only the stale page instance is closed.
+ * Multiple restored pages remain a fail-closed topology error.
+ */
+export async function initializeSingleContextPage(
+  context: Pick<BrowserContext, "pages" | "newPage">,
+  options: InitializeSingleContextPageOptions = {}
+): Promise<Page> {
+  const restored = context.pages();
+  if (restored.length > 1) throw new Error("RESTORED_PAGE_REVIEW_REQUIRED");
+  const previous = restored[0];
+  if (previous !== undefined && !previous.isClosed() && options.allowNonEmptyRestored !== true) {
+    let restoredUrl: string;
+    try {
+      restoredUrl = previous.url();
+    } catch {
+      throw new Error("RESTORED_PAGE_REVIEW_REQUIRED");
+    }
+    if (restoredUrl !== "about:blank") throw new Error("RESTORED_PAGE_REVIEW_REQUIRED");
+  }
+
+  let fresh: Page;
+  try {
+    fresh = await context.newPage();
+  } catch {
+    throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+  }
+
+  if (previous !== undefined) {
+    if (previous === fresh) throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+    if (!previous.isClosed()) {
+      try {
+        await previous.close({ runBeforeUnload: false });
+      } catch {
+        if (!previous.isClosed()) throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+      }
+    }
+  }
+
+  const current = context.pages();
+  if (fresh.isClosed() || current.length !== 1 || current[0] !== fresh) {
+    throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
+  }
+  return fresh;
+}
+
 function expandHome(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
@@ -40,6 +93,21 @@ function expandHome(value: string): string {
 
 export function resolveMacChromePath(value = process.env.TICKET_AGENT_CHROME): string {
   return expandHome(value?.trim() || DEFAULT_MAC_CHROME_PATH);
+}
+
+/** Chrome inherits normal macOS settings but never controller/capability secrets. */
+export function macChromeChildEnvironment(environment: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const child: Record<string, string> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (
+      value !== undefined &&
+      key !== "TICKET_AGENT_TOKEN" &&
+      key !== "TICKET_AGENT_CAPABILITY_KEY"
+    ) {
+      child[key] = value;
+    }
+  }
+  return child;
 }
 
 function containsPath(parent: string, child: string): boolean {
@@ -92,6 +160,7 @@ export function macChromeLaunchOptions(options: MacChromeOptions = {}): Persiste
     executablePath,
     headless: options.headless ?? false,
     acceptDownloads: false,
+    env: macChromeChildEnvironment(),
     // Keep the browser on the user's normal network and visible UI. No proxy,
     // stealth, fingerprint, or remote-debugging flags are added.
     args: []
@@ -153,22 +222,23 @@ export async function acquireProfileLock(profileDir: string): Promise<ProfileLoc
     await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, "utf8");
     await handle.sync();
     const owned = await handle.stat();
-    let released = false;
+    let releasePromise: Promise<void> | undefined;
     return {
       profileDir: resolved,
       lockPath,
-      async release(): Promise<void> {
-        if (released) return;
-        released = true;
-        try {
-          const current = await fs.lstat(lockPath);
-          if (current.dev !== owned.dev || current.ino !== owned.ino || current.isSymbolicLink()) {
-            throw new Error("PROFILE_LOCK_OWNERSHIP_LOST");
+      release(): Promise<void> {
+        releasePromise ??= (async () => {
+          try {
+            const current = await fs.lstat(lockPath);
+            if (current.dev !== owned.dev || current.ino !== owned.ino || current.isSymbolicLink()) {
+              throw new Error("PROFILE_LOCK_OWNERSHIP_LOST");
+            }
+            await fs.unlink(lockPath);
+          } finally {
+            await handle.close();
           }
-          await fs.unlink(lockPath);
-        } finally {
-          await handle.close();
-        }
+        })();
+        return releasePromise;
       }
     };
   } catch (error) {

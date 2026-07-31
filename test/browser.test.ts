@@ -8,6 +8,8 @@ import {
   acquireProfileLock,
   DEFAULT_MAC_PROFILE_DIR,
   DEFAULT_MAC_SANDBOX_PROFILE_DIR,
+  initializeSingleContextPage,
+  macChromeChildEnvironment,
   macChromeLaunchOptions,
   prepareProfileDirectory,
   resolveMacProfileDir
@@ -15,8 +17,10 @@ import {
 import {
   assertLiveAdapterReady,
   localRunnerMode,
+  runnerExitCode,
   singleContextPage,
   takeLiveCapabilityKey,
+  waitForProfileReviewIfRequired,
   waitForVisibleLoginSession
 } from "../src/runner/cli.js";
 
@@ -42,6 +46,22 @@ test("live and non-live browser modes use separate profiles", () => {
     /LIVE_HEADLESS_BLOCKED/
   );
   assert.doesNotThrow(() => macChromeLaunchOptions({ profileScope: "sandbox", headless: true }));
+});
+
+test("Chrome child environment excludes controller and capability secrets", () => {
+  const child = macChromeChildEnvironment({
+    PATH: "/usr/bin:/bin",
+    LANG: "zh_CN.UTF-8",
+    TICKET_AGENT_TOKEN: "controller-secret",
+    TICKET_AGENT_CAPABILITY_KEY: "capability-secret"
+  });
+  assert.deepEqual(child, {
+    PATH: "/usr/bin:/bin",
+    LANG: "zh_CN.UTF-8"
+  });
+  const launch = macChromeLaunchOptions({ profileScope: "sandbox" });
+  assert.equal(launch.env?.TICKET_AGENT_TOKEN, undefined);
+  assert.equal(launch.env?.TICKET_AGENT_CAPABILITY_KEY, undefined);
 });
 
 test("live and sandbox profiles cannot be parent and child directories", () => {
@@ -84,7 +104,10 @@ test("profile lock is exclusive, releasable, and idempotent", async (context) =>
 
   const first = await acquireProfileLock(root);
   await assert.rejects(() => acquireProfileLock(root), /PROFILE_IN_USE/);
-  await first.release();
+  const firstRelease = first.release();
+  const concurrentRelease = first.release();
+  assert.strictEqual(concurrentRelease, firstRelease);
+  await Promise.all([firstRelease, concurrentRelease]);
   await first.release();
 
   const second = await acquireProfileLock(root);
@@ -134,8 +157,8 @@ test("production live mode cannot fall back to LocalRunner", () => {
   assert.equal(localRunnerMode("dry-run"), "dry-run");
 });
 
-test("runner reuses one persistent page and rejects restored multi-page contexts", async () => {
-  const existing = { id: "existing" };
+test("runner topology assertion reuses exactly one live page without creating replacements", async () => {
+  const existing = { id: "existing", isClosed: () => false };
   let newPageCount = 0;
   const onePage = {
     pages: () => [existing],
@@ -149,8 +172,14 @@ test("runner reuses one persistent page and rejects restored multi-page contexts
 
   await assert.rejects(
     () => singleContextPage({
-      pages: () => [existing, { id: "restored-extra" }],
+      pages: () => [existing, { id: "restored-extra", isClosed: () => false }],
       newPage: async () => ({ id: "unexpected" })
+    } as never),
+    /SINGLE_PAGE_CONTEXT_REQUIRED/
+  );
+  await assert.rejects(
+    () => singleContextPage({
+      pages: () => [{ id: "closed", isClosed: () => true }]
     } as never),
     /SINGLE_PAGE_CONTEXT_REQUIRED/
   );
@@ -164,8 +193,249 @@ test("runner reuses one persistent page and rejects restored multi-page contexts
       return page;
     }
   };
-  assert.equal(await singleContextPage(empty as never), created[0]);
-  assert.equal(created.length, 1);
+  await assert.rejects(() => singleContextPage(empty as never), /SINGLE_PAGE_CONTEXT_REQUIRED/);
+  assert.equal(created.length, 0);
+  assert.equal(newPageCount, 0);
+});
+
+test("runner replaces one restored persistent page before official navigation", async () => {
+  const pages: unknown[] = [];
+  let restoredClosed = false;
+  const restored = {
+    url: () => "about:blank",
+    isClosed: () => restoredClosed,
+    close: async () => {
+      restoredClosed = true;
+      const index = pages.indexOf(restored);
+      if (index >= 0) pages.splice(index, 1);
+    }
+  };
+  const fresh = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  pages.push(restored);
+  const context = {
+    pages: () => pages,
+    newPage: async () => {
+      pages.push(fresh);
+      return fresh;
+    }
+  };
+
+  assert.equal(await initializeSingleContextPage(context as never), fresh);
+  assert.equal(restoredClosed, true);
+  assert.deepEqual(pages, [fresh]);
+});
+
+test("runner creates one fresh page when a persistent context restores none", async () => {
+  const pages: unknown[] = [];
+  const fresh = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  let newPageCount = 0;
+  const context = {
+    pages: () => pages,
+    newPage: async () => {
+      newPageCount += 1;
+      pages.push(fresh);
+      return fresh;
+    }
+  };
+
+  assert.equal(await initializeSingleContextPage(context as never), fresh);
+  assert.equal(newPageCount, 1);
+  assert.deepEqual(pages, [fresh]);
+});
+
+test("runner requires review for multiple restored pages before creating or closing any page", async () => {
+  let closeCount = 0;
+  let newPageCount = 0;
+  const restored = [1, 2].map((id) => ({
+    id,
+    isClosed: () => false,
+    close: async () => {
+      closeCount += 1;
+    }
+  }));
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => restored,
+      newPage: async () => {
+        newPageCount += 1;
+        return restored[0];
+      }
+    } as never),
+    /RESTORED_PAGE_REVIEW_REQUIRED/
+  );
+  assert.equal(newPageCount, 0);
+  assert.equal(closeCount, 0);
+});
+
+test("runner tolerates the sole restored page closing while a fresh page opens", async () => {
+  const pages: unknown[] = [];
+  let restoredClosed = false;
+  const restored = {
+    url: () => "about:blank",
+    isClosed: () => restoredClosed,
+    close: async () => {
+      throw new Error("unexpected close call");
+    }
+  };
+  const fresh = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  pages.push(restored);
+  const context = {
+    pages: () => pages,
+    newPage: async () => {
+      restoredClosed = true;
+      pages.splice(0, pages.length, fresh);
+      return fresh;
+    }
+  };
+
+  assert.equal(await initializeSingleContextPage(context as never), fresh);
+  assert.deepEqual(pages, [fresh]);
+});
+
+test("runner leaves the restored page untouched when fresh page creation fails", async () => {
+  let closeCount = 0;
+  const restored = {
+    url: () => "about:blank",
+    isClosed: () => false,
+    close: async () => {
+      closeCount += 1;
+    }
+  };
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => [restored],
+      newPage: async () => {
+        throw new Error("browser closed");
+      }
+    } as never),
+    /SINGLE_PAGE_CONTEXT_REQUIRED/
+  );
+  assert.equal(closeCount, 0);
+});
+
+test("runner fails closed when the restored page cannot be closed", async () => {
+  const pages: unknown[] = [];
+  const restored = {
+    url: () => "about:blank",
+    isClosed: () => false,
+    close: async () => {
+      throw new Error("close blocked");
+    }
+  };
+  const fresh = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  pages.push(restored);
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => pages,
+      newPage: async () => {
+        pages.push(fresh);
+        return fresh;
+      }
+    } as never),
+    /SINGLE_PAGE_CONTEXT_REQUIRED/
+  );
+  assert.deepEqual(pages, [restored, fresh]);
+});
+
+test("runner preserves a non-empty restored page unless a no-submit sandbox explicitly replaces it", async () => {
+  let newPageCount = 0;
+  let closeCount = 0;
+  const blockedRestored = {
+    url: () => "https://buy.damai.cn/order/unknown",
+    isClosed: () => false,
+    close: async () => {
+      closeCount += 1;
+    }
+  };
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => [blockedRestored],
+      newPage: async () => {
+        newPageCount += 1;
+        return blockedRestored;
+      }
+    } as never),
+    /RESTORED_PAGE_REVIEW_REQUIRED/
+  );
+  assert.equal(newPageCount, 0);
+  assert.equal(closeCount, 0);
+
+  const pages: unknown[] = [];
+  let sandboxClosed = false;
+  const sandboxRestored = {
+    url: () => "https://detail.damai.cn/item.htm?id=stale",
+    isClosed: () => sandboxClosed,
+    close: async () => {
+      sandboxClosed = true;
+      pages.splice(pages.indexOf(sandboxRestored), 1);
+    }
+  };
+  const fresh = {
+    url: () => "about:blank",
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  pages.push(sandboxRestored);
+  assert.equal(await initializeSingleContextPage({
+    pages: () => pages,
+    newPage: async () => {
+      pages.push(fresh);
+      return fresh;
+    }
+  } as never, { allowNonEmptyRestored: true }), fresh);
+  assert.equal(sandboxClosed, true);
+  assert.deepEqual(pages, [fresh]);
+});
+
+test("runner rejects a closed fresh page or an unexpected late extra page", async () => {
+  const closedFresh = {
+    isClosed: () => true,
+    close: async () => undefined
+  };
+  const closedPages: unknown[] = [];
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => closedPages,
+      newPage: async () => {
+        closedPages.push(closedFresh);
+        return closedFresh;
+      }
+    } as never),
+    /SINGLE_PAGE_CONTEXT_REQUIRED/
+  );
+
+  const pages: unknown[] = [];
+  const fresh = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  const extra = {
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  await assert.rejects(
+    () => initializeSingleContextPage({
+      pages: () => pages,
+      newPage: async () => {
+        pages.push(fresh, extra);
+        return fresh;
+      }
+    } as never),
+    /SINGLE_PAGE_CONTEXT_REQUIRED/
+  );
+  assert.deepEqual(pages, [fresh, extra]);
 });
 
 test("visible-session wait resolves when Chrome closed before listener registration", async () => {
@@ -184,4 +454,53 @@ test("visible-session wait resolves when Chrome closed before listener registrat
   };
   await waitForVisibleLoginSession(alreadyClosed as never);
   assert.equal(closeListeners, 0);
+});
+
+test("profile topology review waits only for exact live-profile review errors", async () => {
+  const context = { marker: "visible-context" };
+  const notices: string[] = [];
+  let waits = 0;
+  const wait = async (received: unknown): Promise<void> => {
+    assert.equal(received, context);
+    waits += 1;
+  };
+  const notify = (message: string): void => { notices.push(message); };
+
+  await waitForProfileReviewIfRequired(
+    context as never,
+    new Error("RESTORED_PAGE_REVIEW_REQUIRED"),
+    wait as never,
+    notify
+  );
+  await waitForProfileReviewIfRequired(
+    context as never,
+    new Error("SINGLE_PAGE_CONTEXT_REQUIRED"),
+    wait as never,
+    notify
+  );
+  await waitForProfileReviewIfRequired(
+    context as never,
+    new Error("unrelated failure"),
+    wait as never,
+    notify
+  );
+
+  assert.equal(waits, 1);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /RESTORED_PAGE_REVIEW_REQUIRED/);
+});
+
+test("browser-context closure is a nonzero CLI result while ordinary calibration remains reviewable", () => {
+  assert.equal(runnerExitCode({
+    state: "PAGE_CHANGED",
+    message: "BROWSER_CONTEXT_CLOSED:prewarm"
+  } as never), 1);
+  assert.equal(runnerExitCode({
+    state: "PAGE_CHANGED",
+    message: "A verified visible total was not returned"
+  } as never), 0);
+  assert.equal(runnerExitCode({
+    state: "REVIEW_REQUIRED",
+    message: "Dry-run complete"
+  } as never), 0);
 });

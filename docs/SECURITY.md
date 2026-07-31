@@ -15,8 +15,18 @@
    带时区 `saleAt` 必须签入最早消费时间，墙钟和单调时钟都越过该门才可消费。最终不可逆操作必须
    使用审核过的可信浏览器输入，点击结果不等于成功；必须看到唯一订单/待支付证据。
 7. **人工确认成功**：普通 runner 事件不能直接写入 `SUCCESS`。完成状态只能由用户核对官方订单后显式确认。
-8. **单页拓扑**：live lifecycle 只接受专用 persistent context 中的唯一原始页。监听必须在首次快照前安装；恢复标签、popup、新页或原页关闭都会触发 sticky abort，即使额外页随后关闭也不恢复提交。
+8. **启动页与单页拓扑**：自动运行初始存在多个 restored page 时不做选择性清理并 fail-closed。`dry-run`/`mock`
+   可在任何目标导航和动作前替换 sandbox 中唯一的 restored page；`rehearsal`/`live` 只允许替换唯一严格的
+   `about:blank`，非空或多个恢复页保持可见并要求人工复核。建立 canonical page 后不得创建替代页；live
+   发布门还要求同一个 listener-first sticky guard 从官方导航前覆盖 resident、capability 和 click 全链路，
+   此后 popup、新页、context 关闭或原页关闭即使恢复也不得继续提交。
 9. **本地数据**：Chrome profile 留在用户 Mac，live 与 sandbox profile 分离、权限为 `0700` 且单实例运行。SQLite 文件权限为 `0600`。
+
+启动归一化只关闭允许模式下的一个页面实例，不会删除 profile 或主动清除登录数据，但会改变恢复标签列表。
+解决 `RESTORED_PAGE_REVIEW_REQUIRED`、`SINGLE_PAGE_CONTEXT_REQUIRED` 或 browser-context-closed 错误时，
+禁止删除整个 profile、复制登录态或擅自清理 lock。
+Chrome 子进程环境会显式剔除 controller Bearer token 与 capability key；capability key 也必须在任何 Chrome
+启动前从 runner 环境移除，并在人工 profile review 前清零其内存副本。
 
 ## 真实模式发布门槛
 
@@ -34,8 +44,9 @@ Mac ref→Keychain label→选中 DOM 闭环、同步一次消费、最终证据
 授权链路。grant 存在后通用 runner event 不得改写 run；prepared ACK 和 attempt 会在事务内再核对
 `PREWARM` run、`RUNNING` plan、`HELD` lock 及完整绑定。首次 delivery envelope 不持久化且绝不重发；
 ACK 失败零点击，页面拓扑违反会粘滞取消，点击异常不重试。当前剩余的
-上线硬门是大麦真实页面 selector/evidence contract 与 Mac 无提交校准，不能仅凭合成 Chrome 基准开启
-live。
+上线硬门包括大麦真实页面 selector/evidence contract、Mac 无提交确认页演练，以及从官方导航前开始的
+sticky page-topology guard。当前 guard 尚未覆盖 rehearsal/live 的完整导航窗口，因此这两个模式不得用于本轮
+Mac 验收。浏览器启动生命周期修复、默认 sandbox 连续两次 dry-run 和合成 Chrome 基准都不能据此开启 live。
 
 Controller Bearer token 与 `TICKET_AGENT_CAPABILITY_KEY` 必须是两把不同的至少 32 字节 secret，且都
 不得进入日志、SQLite、浏览器、计划或仓库。当前 capability 使用 HMAC：个人 Mac 与 controller 属于

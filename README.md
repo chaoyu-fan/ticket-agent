@@ -10,14 +10,14 @@
 `https://github.com/chaoyu-fan/ticket-agent.git` 的 `main` 分支。
 
 **本轮只执行 A–D、遵守 E，并按 F 回传。** 完成后必须停止并回传报告；不要启动 controller、创建或武装实盘计划，
-不要执行 `--live`，也不要自行修改 readiness 开关。本节后面的 controller/live 说明只是后续设计文档，
+不要执行 `rehearsal` 或 `--live`，也不要自行修改 readiness 开关。本节后面的 rehearsal/controller/live 说明只是后续设计文档，
 不是本轮执行指令。
 
 ### 交接目标
 
 1. 安全地拉取最新 `main`，不覆盖 Mac 上任何未提交改动。
 2. 在 Mac 的真实 Google Chrome 环境通过构建、全量测试、mock smoke 和四类性能基准。
-3. 只在上述验收通过后，执行大麦真实页的 `dry-run` 或无提交 `rehearsal`。
+3. 只在上述验收通过后，使用默认 sandbox 连续执行两次大麦真实页 `dry-run`；本轮不执行 `rehearsal`。
 4. 把规定的脱敏证据回传给用户；不得将 Cookie、姓名、证件、Chrome profile 或页面 HTML 上传到 GitHub。
 
 ### A. 拉取前检查
@@ -113,7 +113,7 @@ npm --version
 
 - `setup-macos.sh` 的 Chrome、路径隔离和符号链接预检成功；该脚本不会创建 profile，runner 首次使用时才会安全创建并设为 `0700`；
 - `npm run check` 成功；
-- 当前基线的测试应为 `252/252` 通过；
+- 当前基线的测试应为 `269/269` 通过；
 - `npm run smoke` 应为 `7/7` mock 场景通过。
 
 ### C. Mac 性能验收
@@ -154,17 +154,38 @@ git status --short
 
 ### D. 真实大麦页面的无提交校准
 
-只有 A–C 全部通过后才能执行本阶段。先运行零点击 `dry-run`：
+只有 A–C 全部通过后才能执行本阶段。使用同一个默认 sandbox profile 顺序运行两次零点击
+`dry-run`；第一轮未通过时停止，不执行第二轮：
 
 ```bash
 npm run build
-npm run start:runner -- --dry-run \
+
+env -u TICKET_AGENT_SANDBOX_PROFILE \
+  npm run start:runner -- --dry-run \
+  --plan examples/damai-iwwf-readonly-plan.json
+
+env -u TICKET_AGENT_SANDBOX_PROFILE \
+  npm run start:runner -- --dry-run \
   --plan examples/damai-iwwf-readonly-plan.json
 ```
 
 该例只用于低热度页面身份和 selector 校准。它的 `attendeeRefs`、`sessions` 和 `tiers` 为空，
 `autoSubmitOrder=false`，不读 Keychain、不选观演人、不提交订单。停在 `PAGE_CHANGED` 或缺少唯一总价可以是预期的
-校准结果。
+校准结果。本轮 profile 生命周期修复的验收则更严格：两轮都必须是 `REVIEW_REQUIRED`、当前已知观测总价
+`5800` 分且零选票/零提交点击。两轮之间不得删除、迁移、重命名或替换默认 sandbox profile，也不得手工
+清理其会话文件；临时 sandbox profile 的成功结果只能用于诊断，不能替代这两轮默认 profile 验收。
+
+为避免 Chrome 唯一恢复页自行关闭并带走整个 context，runner 会在首次目标导航前创建自己拥有的新页，
+再按模式处理恢复页：
+
+- `dry-run` / `mock` 使用无提交 sandbox；初始 0/1 页时创建 fresh page，并可关闭唯一恢复页；初始多页
+  不清理并 fail-closed。
+- `rehearsal` / `live` 使用 live profile；只替换唯一 `about:blank`，唯一非空恢复页会报
+  `RESTORED_PAGE_REVIEW_REQUIRED` 并原样保留，初始多页也 fail-closed。
+- `login-only` 保留全部恢复页，只另开一个人工登录页，不在旧页执行自动操作。
+
+关闭唯一 sandbox 恢复页会改变 Chrome 的恢复标签列表，但代码不会删除 profile 目录，也不会主动清除
+Cookie、localStorage、Keychain 或登录数据。当前 readiness 仍关闭；上述 live 策略不是本轮实盘授权。
 
 如果用户明确要求准备登录，agent 只负责打开 live 专用可见 Chrome；账号、密码、短信或人脸验证均由用户本人在
 浏览器里完成，不得让用户粘贴到终端或聊天。完成登录后由用户关闭浏览器，或在终端按 `Ctrl-C`：
@@ -175,19 +196,12 @@ npm run start:runner -- --login-only \
   --url https://www.damai.cn/
 ```
 
-`login-only` 不读取计划、不选择票档且没有下单能力。只有用户确认已完成登录，并再次明确要求继续无提交演练，
-agent 才可执行：
-
-```bash
-npm run start:runner -- --rehearsal --confirm-rehearsal \
-  --plan examples/damai-iwwf-readonly-plan.json \
-  --url 'https://detail.damai.cn/item.htm?id=1067493715985'
-```
-
-`rehearsal` 模式可以操作计划中明确列出的可逆选项，但在代码层没有 controller/capability 和 submit 权限。
-当前仓库示例的场次、票档和观演人均为空，因此本轮仍只是页面校准，不是完整确认页演练。没有用户明确提供的
-`maxTotalFen`、场次/票档顺序、数量和 Mac 本地私有计划时，不得猜测或补造这些字段。遇到 CAPTCHA、短信/人脸验证、
-登录异常、页面改版或跳出官方域名时，停止并交给用户，不得尝试绕过。
+`login-only` 不读取计划、不选择票档且没有下单能力。它保留恢复标签并等待整个 TicketAgent 浏览器关闭；
+只关闭新开的登录标签时，若仍有其他恢复页，runner 和 profile lock 会继续等待。本轮即使登录完成也不得执行
+`rehearsal`：导航前 sticky topology guard 尚未覆盖其完整生命周期。后续修复并经单独指令确认后，才按
+[docs/MACOS.md](docs/MACOS.md) 的无提交流程演练。没有用户明确提供的 `maxTotalFen`、场次/票档顺序、数量
+和 Mac 本地私有计划时，不得猜测或补造这些字段。遇到 CAPTCHA、短信/人脸验证、登录异常、页面改版或跳出
+官方域名时，停止并交给用户，不得尝试绕过。
 
 runner 执行后只核对已实际创建的 profile 权限；`NOT_CREATED` 不是失败，表示本轮没有使用该 profile：
 
@@ -208,37 +222,40 @@ check_profile_mode() {
   [ "$mode" = 700 ] || { echo "$label: FAIL(mode=$mode)"; return 1; }
   echo "$label: 700"
 }
+check_profile_lock_absent() {
+  local label="$1" profile_dir="$2" lock_file
+  lock_file="$profile_dir/.ticket-agent.runner.lock"
+  if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+    echo "$label lock: FAIL(present)"
+    return 1
+  fi
+  echo "$label lock: ABSENT"
+}
 profile_status=0
-check_profile_mode sandbox "${TICKET_AGENT_SANDBOX_PROFILE:-$HOME/Library/Application Support/TicketAgent/SandboxChromeProfile}" || profile_status=1
-check_profile_mode live "${TICKET_AGENT_PROFILE:-$HOME/Library/Application Support/TicketAgent/ChromeProfile}" || profile_status=1
+default_sandbox_profile="$HOME/Library/Application Support/TicketAgent/SandboxChromeProfile"
+default_live_profile="$HOME/Library/Application Support/TicketAgent/ChromeProfile"
+check_profile_mode sandbox "$default_sandbox_profile" || profile_status=1
+check_profile_mode live "$default_live_profile" || profile_status=1
+check_profile_lock_absent sandbox "$default_sandbox_profile" || profile_status=1
+check_profile_lock_absent live "$default_live_profile" || profile_status=1
 git status --short
 exit "$profile_status"
 ```
 
-凡已创建的 profile，mode 必须为 `700`；最终 `git status --short` 必须为空。
+凡已创建的默认 profile，mode 必须为 `700`，两个默认 profile 的 runner lock 都必须为 `ABSENT`；最终
+`git status --short` 必须为空。这里只读检查 lock，绝不自动删除。
 
-如果 `dry-run` 在 `PREWARM` 后出现 `RUNNER_FAILED:...Target page, context or browser has been closed`，
-这只是安全失败，不代表页面校准成功：不要继续 `rehearsal` 或 `--live`。确认不是手动关闭专用 Chrome，保留完整
-runner 事件和错误文本后，可先完全关闭该专用浏览器再重试一次；若再次出现，按原错误回传并停止，不要删除
-未知归属的 profile lock，也不要自动重试购票。
-
-若第一次 dry-run 关闭了页面，可做一次不接触默认 profile 的 A/B 重试，以排除 Chrome 恢复页或旧 profile 状态：
-
-```bash
-tmp_profile="$(mktemp -d /private/tmp/ticket-agent-sandbox-probe.XXXXXX)"
-chmod 700 "$tmp_profile"
-TICKET_AGENT_SANDBOX_PROFILE="$tmp_profile" \
-  npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
-```
-
-这只创建一个没有账号状态的临时 sandbox profile，不迁移、不删除默认 profile，也不改变任何 live 设置。若全新
-profile 成功，记录为默认 profile/Chrome 恢复状态 blocker；若仍出现相同错误，保留完整错误文本并停止，等待代码级
-生命周期修复，仍不得执行 `rehearsal` 或 `--live`。
+如果任一默认 sandbox dry-run 出现 `PAGE_CHANGED` 且消息包含
+`BROWSER_CONTEXT_CLOSED:<phase>`、`SINGLE_PAGE_CONTEXT_REQUIRED`，或出现 legacy/raw
+`RUNNER_FAILED:...Target page, context or browser has been closed`，即使命令退出码为 0 也不算通过。保留脱敏
+状态、阶段和错误类别后停止；不要继续 `rehearsal` 或 `--live`，不要删除/迁移默认 profile、Cookie、
+登录态或未知归属的 profile lock，也不要用临时 profile 的既有 PASS 把本轮标成完成。只有默认 profile
+失败且维护者明确要求定位时，才可再次使用临时 sandbox A/B；其结果只用于诊断。
 
 ### E. 必须保持的禁止项
 
 - 不得把大麦 `liveReady` 或 `fastPathReady` 改为 `true`；猫眼也继续 fail-closed。
+- 本轮不得执行 `rehearsal`；其导航前 sticky topology guard 尚未完成独立验收。
 - 不得执行 `--live`，除非真实确认页 contract 已审核、Mac 演练已通过，且用户明确提供
   `maxTotalFen`、场次顺序、票档顺序、数量和提交确认。
 - 不得添加私有 API、验证码解答、代理池、多账号/多页并发、指纹伪装、坐标点击、`force:true` 或高频刷新。
@@ -261,11 +278,14 @@ benchmark loopback runs 1-3: <各轮 gate 结果和 p50/p95/p99>
 benchmark state-machine runs 1-3: <各轮 exit=0 和 p50/p95/p99；无固定 latency gate>
 benchmark trusted-click runs 1-3: <各轮 gate 结果、p50/p95/p99 和 faultChecks>
 benchmark armed-fast-path runs 1-3: <各轮 hot/trusted-click/T0-to-click 的 p50/p95/p99 和六项 faultChecks>
-dry-run: NOT_RUN | <state, observed total if present, zero-click confirmation>
+default sandbox dry-run run 1: NOT_RUN | <state, observed total if present, zero-click confirmation>
+default sandbox dry-run run 2: NOT_RUN | <state, observed total if present, zero-click confirmation>
+temporary sandbox A/B: NOT_RUN | <diagnostic result only; never substitutes for the two default runs>
 rehearsal: NOT_RUN | <state, zero-submit confirmation>
 liveReady / fastPathReady: false / false
 profile path isolation preflight: PASS | FAIL
 sandbox / live profile mode: 0700 | NOT_CREATED | FAIL / 0700 | NOT_CREATED | FAIL
+profile locks: ABSENT | FAIL
 secrets or identity data persisted/uploaded: NO | YES
 raw benchmark JSON uploaded or added to repo: NO | YES
 blockers: <none or exact blocker>
@@ -273,8 +293,10 @@ blockers: <none or exact blocker>
 
 定义完成：仓库包含 `d0e8e77`，工作树干净，基础验收通过，12 条基准命令全部返回 0、12 份报告结构和语义有效，
 有固定性能门的三类基准全部过门，且 armed fast path 的六项 fault check 全为 1；`state-machine` 只记录三轮实测摘要。
-整个过程不得打开任何 live 开关。未完成的真实大麦 selector/confirmation contract 校准必须如实列为 blocker，不能把
-合成基准描述为真实购票就绪。
+同一默认 sandbox 的两轮真实页 dry-run 还必须均为 `REVIEW_REQUIRED`、当前已知观测总价 `5800` 分、零点击，
+profile 为 `0700` 且无残留 runner lock；临时 profile PASS 不能替代。整个过程不得执行 rehearsal 或打开任何
+live 开关。未完成的真实大麦 selector/confirmation contract 校准必须如实列为 blocker，不能把合成基准描述为
+真实购票就绪。
 
 ## 当前状态
 

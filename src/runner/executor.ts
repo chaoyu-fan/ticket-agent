@@ -35,6 +35,32 @@ function isNavigationContextChange(error: unknown): boolean {
     /most likely because of a navigation/i.test(message);
 }
 
+function isPageClosedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:target page, context or browser has been closed|target closed|page has been closed)/i.test(message);
+}
+
+function pageIsClosed(page: LocalRunnerOptions["page"]): boolean {
+  if (page === undefined || typeof page.isClosed !== "function") return false;
+  try {
+    return page.isClosed();
+  } catch {
+    return true;
+  }
+}
+
+function browserContextClosedMessage(
+  page: LocalRunnerOptions["page"],
+  error: unknown,
+  phase: string
+): string | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("BROWSER_CONTEXT_CLOSED:")) return message;
+  return pageIsClosed(page) || isPageClosedError(error)
+    ? `BROWSER_CONTEXT_CLOSED:${phase}`
+    : undefined;
+}
+
 function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("RUN_ABORTED"));
   return new Promise((resolve, reject) => {
@@ -262,10 +288,17 @@ export class LocalRunner {
       if (this.signal?.aborted) {
         return stopForGuard("FAILED", `RUN_ABORTED:${label}`, observedTotalFen);
       }
+      if (pageIsClosed(page)) {
+        return stopForGuard("PAGE_CHANGED", `BROWSER_CONTEXT_CLOSED:${label}`, observedTotalFen);
+      }
       let observedUrl: string;
       try {
         observedUrl = explicitUrl ?? page.url();
-      } catch {
+      } catch (error) {
+        const closed = browserContextClosedMessage(page, error, label);
+        if (closed !== undefined) {
+          return stopForGuard("PAGE_CHANGED", closed, observedTotalFen);
+        }
         return stopForGuard("PAGE_CHANGED", `TARGET_BLOCKED:${label}:page URL is unreadable`, observedTotalFen);
       }
       const check = checkObservedTarget(request.plan, request.mode, observedUrl);
@@ -286,6 +319,15 @@ export class LocalRunner {
       try {
         signals = await adapter.inspect({ page, plan: request.plan }, adapterPhase);
       } catch (error) {
+        if (pageIsClosed(page) || isPageClosedError(error)) {
+          return {
+            stopped: await stopForGuard(
+              "PAGE_CHANGED",
+              `BROWSER_CONTEXT_CLOSED:${label}`,
+              observedTotalFen
+            )
+          };
+        }
         inspectionFailed = true;
         inspectionError = error;
       }
@@ -329,6 +371,8 @@ export class LocalRunner {
         signal: cancellation.signal
       }).then((result) => ({ kind: "dom" as const, result })).catch((error: unknown) => {
         if (isNavigationContextChange(error)) return { kind: "context-changed" as const };
+        const closed = browserContextClosedMessage(page, error, label);
+        if (closed !== undefined) throw new Error(closed);
         throw error;
       });
 
@@ -386,7 +430,13 @@ export class LocalRunner {
       }
       stopped = await checkTargetBoundary("after navigation");
       if (stopped) return stopped;
-      if (navigationFailed) throw navigationError;
+      if (navigationFailed) {
+        const closed = browserContextClosedMessage(page, navigationError, "navigation");
+        if (closed !== undefined) {
+          return stopForGuard("PAGE_CHANGED", closed, observedTotalFen);
+        }
+        throw navigationError;
+      }
 
       let inspection = await inspect("prewarm", "prewarm");
       if ("stopped" in inspection) return inspection.stopped;
@@ -548,6 +598,10 @@ export class LocalRunner {
         stopped = await checkTargetBoundary(`after ${item.phase} action`);
         if (stopped) return stopped;
         if (actionResult === undefined) {
+          const closed = browserContextClosedMessage(page, actionError, `${item.phase} action`);
+          if (closed !== undefined) {
+            return stopForGuard("PAGE_CHANGED", closed, observedTotalFen);
+          }
           const actionMessage = item.phase === "attendee"
             ? "Attendee selection failed; sensitive attendee details were suppressed"
             : `Action failed:${actionError instanceof Error ? actionError.message : "unexpected adapter error"}`;
@@ -765,6 +819,14 @@ export class LocalRunner {
       await emit("PAY_REQUIRED", message, { observedTotalFen, orderReference });
       return result(message);
     } catch (error) {
+      const closed = browserContextClosedMessage(page, error, "runner");
+      if (closed !== undefined) {
+        try {
+          return await stopForGuard("PAGE_CHANGED", closed, observedTotalFen);
+        } catch {
+          return result(closed);
+        }
+      }
       const message = `RUNNER_FAILED:${error instanceof Error ? error.message : "RUNNER_UNEXPECTED_ERROR"}`;
       if (canTransition(current, "FAILED")) {
         try {

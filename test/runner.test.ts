@@ -608,6 +608,105 @@ test("dry-run may inspect a page but never performs selection or submit actions"
   assertResultConsistent(result);
 });
 
+test("a page closed during dry-run inspection stops as sanitized PAGE_CHANGED with zero actions", async () => {
+  const adapter = new FakeDamaiAdapter();
+  adapter.onInspect = () => {
+    throw new Error("locator.count: Target page, context or browser has been closed");
+  };
+  const result = await new LocalRunner({ page: fakePage(), adapter }).run({
+    runId: "run-dry-closed-page",
+    plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+    mode: "dry-run"
+  });
+
+  assert.equal(result.state, "PAGE_CHANGED");
+  assert.match(result.message, /^BROWSER_CONTEXT_CLOSED:prewarm$/);
+  assert.doesNotMatch(result.message, /locator\.count|Target page/i);
+  assert.equal(adapter.actionCount, 0);
+  assert.equal(adapter.submitCount, 0);
+  assertResultConsistent(result);
+});
+
+test("browser-context closures are sanitized across navigation, DOM wait, and reversible action paths", async (t) => {
+  await t.test("navigation", async () => {
+    const adapter = new FakeDamaiAdapter();
+    adapter.navigate = async (page, url) => {
+      (page as MutableFakePage).setUrl(url);
+      throw new Error("page.goto: Target page, context or browser has been closed");
+    };
+    const result = await new LocalRunner({ page: fakePage(), adapter }).run({
+      runId: "run-navigation-closed-page",
+      plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+      mode: "dry-run"
+    });
+
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.equal(result.message, "BROWSER_CONTEXT_CLOSED:navigation");
+    assert.doesNotMatch(result.message, /page\.goto|Target page/i);
+    assert.equal(adapter.actionCount, 0);
+    assertResultConsistent(result);
+  });
+
+  await t.test("URL boundary read", async () => {
+    const adapter = new FakeDamaiAdapter();
+    adapter.navigate = async () => undefined;
+    const page = {
+      url: () => {
+        throw new Error("page.url: Target page, context or browser has been closed");
+      }
+    } as unknown as Page;
+    const result = await new LocalRunner({ page, adapter }).run({
+      runId: "run-url-read-closed-page",
+      plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+      mode: "dry-run"
+    });
+
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.equal(result.message, "BROWSER_CONTEXT_CLOSED:after navigation");
+    assert.doesNotMatch(result.message, /page\.url|Target page/i);
+    assert.equal(adapter.actionCount, 0);
+    assertResultConsistent(result);
+  });
+
+  await t.test("DOM wait", async () => {
+    const adapter = new EventDrivenFakeDamaiAdapter();
+    adapter.currentSignals = signals({ inOfficialQueue: true });
+    const page = eventDrivenFakePage(() => {
+      throw new Error("page.evaluate: Target page, context or browser has been closed");
+    });
+    const result = await new LocalRunner({ page, adapter }).run({
+      runId: "run-dom-wait-closed-page",
+      plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123" }),
+      mode: "live"
+    });
+
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.equal(result.message, "BROWSER_CONTEXT_CLOSED:official queue");
+    assert.doesNotMatch(result.message, /page\.evaluate|Target page/i);
+    assert.equal(adapter.actionCount, 0);
+    assertResultConsistent(result);
+  });
+
+  await t.test("reversible action", async () => {
+    const adapter = new FakeDamaiAdapter(false);
+    adapter.onAction = () => {
+      throw new Error("locator.click: Target page, context or browser has been closed");
+    };
+    const result = await new LocalRunner({ page: fakePage(), adapter }).run({
+      runId: "run-action-closed-page",
+      plan: plan({ officialUrl: "https://detail.damai.cn/item.htm?id=123", eventId: "123" }),
+      mode: "rehearsal"
+    });
+
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.equal(result.message, "BROWSER_CONTEXT_CLOSED:session action");
+    assert.doesNotMatch(result.message, /locator\.click|Target page/i);
+    assert.equal(adapter.actionCount, 1);
+    assert.equal(adapter.submitCount, 0);
+    assertResultConsistent(result);
+  });
+});
+
 test("prewarm captcha stops immediately without entering login or queue states", async () => {
   const adapter = new FakeDamaiAdapter();
   adapter.currentSignals = signals({ captchaRequired: true });
