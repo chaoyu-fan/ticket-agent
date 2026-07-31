@@ -25,13 +25,48 @@
 默认 Mac 项目目录是 `/Users/jakefan/ticket-agent`。如果目录已存在：
 
 ```bash
+set -e
 cd /Users/jakefan/ticket-agent
-git status --short
-test "$(git branch --show-current)" = main
-test "$(git remote get-url origin)" = https://github.com/chaoyu-fan/ticket-agent.git
+if [ -n "$(git status --short)" ]; then
+  echo '工作树有未提交改动，停止：' >&2
+  git status --short
+  exit 1
+fi
+branch="$(git branch --show-current)"
+if [ "$branch" != main ]; then
+  echo "当前分支不是 main：$branch" >&2
+  exit 1
+fi
+verify_ticket_agent_origin() {
+  local raw normalized
+  raw="$(git remote get-url origin 2>/dev/null)" || {
+    echo 'origin 缺失或不可读取' >&2
+    return 1
+  }
+  normalized="${raw%/}"
+  normalized="${normalized%.git}"
+  case "$normalized" in
+    https://github.com/chaoyu-fan/ticket-agent|\
+    https://github.com:443/chaoyu-fan/ticket-agent|\
+    git@github.com:chaoyu-fan/ticket-agent|\
+    git@ssh.github.com:chaoyu-fan/ticket-agent|\
+    ssh://git@github.com/chaoyu-fan/ticket-agent|\
+    ssh://git@github.com:22/chaoyu-fan/ticket-agent|\
+    ssh://git@github.com:443/chaoyu-fan/ticket-agent|\
+    ssh://git@ssh.github.com:443/chaoyu-fan/ticket-agent)
+      echo "origin 已验证：$raw"
+      ;;
+    *)
+      echo "origin 不是 ticket-agent GitHub 仓库：$raw" >&2
+      return 1
+      ;;
+  esac
+}
+verify_ticket_agent_origin
 ```
 
-只有工作树输出为空、当前分支为 `main` 且 `origin` 正是上面的仓库时才继续。如果有任何改动，或任一检查失败，
+只有工作树为空、当前分支为 `main` 且上述校验确认 `origin` 指向 `ticket-agent` 仓库时才继续；已有合法 SSH origin 不需要改写。
+如果有任何改动，或任一检查失败，
 不要执行 `reset`、`clean`、`checkout --` 或覆盖文件；立即停止并向用户报告具体输出。全部通过后执行：
 
 ```bash
@@ -43,11 +78,17 @@ git log -1 --oneline
 `git merge-base` 必须返回 0。如果项目目录不存在，才执行全新 clone：
 
 ```bash
+set -e
 cd /Users/jakefan
 git clone https://github.com/chaoyu-fan/ticket-agent.git
 cd ticket-agent
-test "$(git branch --show-current)" = main
-test "$(git remote get-url origin)" = https://github.com/chaoyu-fan/ticket-agent.git
+branch="$(git branch --show-current)"
+[ "$branch" = main ] || { echo "clone 后当前分支不是 main：$branch" >&2; exit 1; }
+origin_url="$(git remote get-url origin)"
+case "$origin_url" in
+  https://github.com/chaoyu-fan/ticket-agent|https://github.com/chaoyu-fan/ticket-agent.git) ;;
+  *) echo "clone 后 origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
+esac
 git merge-base --is-ancestor d0e8e77 HEAD
 ```
 
