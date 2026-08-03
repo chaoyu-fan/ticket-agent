@@ -6,9 +6,11 @@
 
 1. **目标绑定**：初始链接必须匹配计划平台；导航、选择和提交前后都必须再次验证当前页面仍在允许的官方域名或本机 mock 边界内。
 2. **活动绑定**：计划中的活动 ID/标题必须与可见页面一致。跨平台同一活动使用 `canonicalEventKey` 竞争同一购买锁。
-3. **模式隔离**：`dry-run` 零点击；`mock` 只访问 loopback 且永不提交；`rehearsal` 无 controller/capability；
-   `live` 必须显式确认、适配器已人工审核并使用可见浏览器，而且 CLI 只能走 resident fast path，代码
-   明确拒绝回退 `LocalRunner`。
+3. **模式隔离**：`dry-run` 零点击；`mock` 只访问 loopback 且永不提交；legacy `rehearsal` 无
+   controller/capability；`contract-rehearsal` 使用 live profile 和同一 selection/submit-readiness
+   contract，但也没有 controller/capability，并在导航前安装不可逆 click/form shield；`live` 必须显式
+   确认、适配器已人工审核并使用可见浏览器，而且 CLI 只能走 resident fast path，代码明确拒绝回退
+   `LocalRunner`。
 4. **价格不可变**：唯一可见订单总价在 `VERIFY_PRICE` 首次记录后不可覆盖；最终点击前必须再次读取并与快照完全相同，同时不超过总预算和票档单价上限。
 5. **选择可证实**：场次、票档、数量、观演人及连座要求必须有明确选中态或订单摘要证据。缺失、歧义或页面改版时停止。
 6. **一次性提交**：只有控制器在价格快照一致且成功取得活动购买锁后，才能授予一次提交许可；计划的
@@ -17,10 +19,13 @@
 7. **人工确认成功**：普通 runner 事件不能直接写入 `SUCCESS`。完成状态只能由用户核对官方订单后显式确认。
 8. **启动页与单页拓扑**：自动运行初始存在多个 restored page 时不做选择性清理并 fail-closed。`dry-run`/`mock`
    可在任何目标导航和动作前替换 sandbox 中唯一的 restored page；`rehearsal`/`live` 只允许替换唯一严格的
-   `about:blank`，非空或多个恢复页保持可见并要求人工复核。建立 canonical page 后不得创建替代页；live
-   发布门还要求同一个 listener-first sticky guard 从官方导航前覆盖 resident、capability 和 click 全链路，
-   此后 popup、新页、context 关闭或原页关闭即使恢复也不得继续提交。
-9. **本地数据**：Chrome profile 留在用户 Mac，live 与 sandbox profile 分离、权限为 `0700` 且单实例运行。SQLite 文件权限为 `0600`。
+   `about:blank`，`contract-rehearsal` 采用相同 live-profile 策略；非空或多个恢复页保持可见并要求人工
+   复核。建立 canonical page 后不得创建替代页；contract rehearsal 的同一个 listener-first sticky
+   guard 从官方导航前覆盖 shield、resident 和最终证据，live 的同一 guard 继续覆盖 capability 和 click
+   全链路。此后 popup、新页、context 关闭或原页关闭即使恢复也不得继续。
+9. **本地数据**：Chrome profile 留在用户 Mac，live 与 sandbox profile 分离、权限为 `0700` 且单实例运行。
+   contract-rehearsal 私有 plan/contract 必须是仓库外普通文件且权限为 `0600`；plan 只含 opaque
+   attendee refs，Keychain labels 仅在进程内解析并清零。SQLite 文件权限为 `0600`。
 
 启动归一化只关闭允许模式下的一个页面实例，不会删除 profile 或主动清除登录数据，但会改变恢复标签列表。
 解决 `RESTORED_PAGE_REVIEW_REQUIRED`、`SINGLE_PAGE_CONTEXT_REQUIRED` 或 browser-context-closed 错误时，
@@ -48,6 +53,11 @@ CLI 在首次官方导航前创建，并将同一实例传入 rehearsal/live lif
 关闭、context 关闭和 listener 清理。当前剩余的上线硬门包括大麦真实页面 selector/evidence contract、
 Mac 无提交确认页演练和 contract-driven 验收；guard 的代码测试通过、浏览器启动生命周期修复、默认
 sandbox 连续两次 dry-run 或合成 Chrome 基准都不能据此开启 live。
+
+`contract-rehearsal` 的成功结果固定为无提交人工复核：不可逆 click/form shield、同一主文档
+`documentStable=true` 与 sticky topology guard 必须都有效，输出保持脱敏且 `zeroSubmit=true`。它只证明 selection 与唯一 submit readiness；
+`postSubmitEvidence` 必须保持 `NOT_OBSERVED`，真实订单号/待支付证据仍是 blocker。完成三轮也不得自动
+修改 `liveReady`、`fastPathReady` 或把私有 contract 写入 adapter。
 
 Controller Bearer token 与 `TICKET_AGENT_CAPABILITY_KEY` 必须是两把不同的至少 32 字节 secret，且都
 不得进入日志、SQLite、浏览器、计划或仓库。当前 capability 使用 HMAC：个人 Mac 与 controller 属于

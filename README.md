@@ -5,8 +5,9 @@
 ## 给 macOS Agent 的交接（从这里开始）
 
 如果你是在用户 Mac 上接手本仓库的 agent，当前任务不是立即实盘下单，而是先验收已推送的
-常驻低延迟快路径，再进行无提交的真实大麦页面校准。功能基线提交为 `d0e8e77`；文档提交可能使
-`main` 的 HEAD 更新，但当前 `main` 必须包含该基线。仓库固定为
+常驻低延迟快路径，再进行无提交的真实大麦页面校准。当前功能检查点为 `d3d1963`（包含导航前
+sticky page-topology guard 与 contract-driven 无提交演练入口）；文档提交可能使 `main` 的 HEAD 更新，
+但当前 `main` 必须至少包含该检查点。仓库固定为
 `https://github.com/chaoyu-fan/ticket-agent.git` 的 `main` 分支。
 
 当前 HEAD 还包含导航前的 sticky page-topology guard：它在官方导航前先监听
@@ -53,6 +54,70 @@ git status --short
 **不满足增量路径前置条件时，本轮只执行 A–D、遵守 E，并按 F 回传。** 完成后必须停止并回传报告；不要启动 controller、创建或武装实盘计划，
 不要执行 `rehearsal` 或 `--live`，也不要自行修改 readiness 开关。本节后面的 rehearsal/controller/live 说明只是后续设计文档，
 不是本轮执行指令。
+
+### 增量回归之后的下一步（contract-driven、仍无提交）
+
+Mac 已回传 `HEAD=026c7f4`、`279/279`、`smoke 7/7` 且 `liveReady=false / fastPathReady=false` 后，先拉取
+包含 contract-rehearsal 入口的最新 `main`，重新完成该增量代码回归（当前预期全量测试 `288/288`、`smoke 7/7`），
+再进入真实大麦 selector/evidence 校准。只执行以下增量回归，不重复 benchmark、默认 sandbox dry-run、legacy
+rehearsal 或 live：
+
+```bash
+set -e
+cd /Users/jakefan/ticket-agent
+[ -z "$(git status --short)" ] || { git status --short; exit 1; }
+[ "$(git branch --show-current)" = main ] || { echo '当前分支不是 main' >&2; exit 1; }
+origin_url="$(git remote get-url origin)"
+case "${origin_url%/}" in
+  https://github.com/chaoyu-fan/ticket-agent|https://github.com/chaoyu-fan/ticket-agent.git|\
+  git@github.com:chaoyu-fan/ticket-agent.git|git@ssh.github.com:chaoyu-fan/ticket-agent.git) ;;
+  *) echo "origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
+esac
+git pull --ff-only origin main
+git merge-base --is-ancestor d3d1963 HEAD
+[ -f src/runner/contract-rehearsal.ts ] || { echo 'contract-rehearsal entry missing' >&2; exit 1; }
+npm ci --ignore-scripts
+bash scripts/setup-macos.sh
+npm run check
+TMPDIR=/private/tmp npm test
+npm run smoke
+[ -z "$(git status --short)" ]
+```
+
+通过后保持 `liveReady=false / fastPathReady=false` 并回传新 HEAD、`288/288`、`7/7`；失败即停止。
+然后再向用户收集官方活动 URL/ID/准确标题、数量、`maxTotalFen`、场次和票档
+优先顺序、连座要求及 Mac 本地 opaque 观演人 refs；不完整时停止，不猜测字段。
+
+仓库没有自动 DOM/HTML 导出器或 selector 猜测器。Mac agent 只能在官方可见页面上用 DevTools 或受控的
+只读查询逐项核对 selector 的唯一性、可见性、selected marker、价格整数分和阻断态，并把结果写入仓库外
+权限为 `0600` 的私有 `FastPathContract` 文件。旧的 `--rehearsal` 是 legacy adapter 路径，即使返回
+`REVIEW_REQUIRED` 也不能证明 fast path contract 可用。校准 plan 建议省略 `saleAt`；若填写未来时间，
+T-10 前解析 Keychain 会按设计停止（`ATTENDEE_RESOLUTION_TOO_EARLY`），正式 live 的带时区 `saleAt`
+需另行审核。
+
+contract 的 selection/submit-readiness 字段和同样为 `0600` 的私有 rehearsal plan 完成手工校准后，
+使用新入口在同一 live profile 上连续三次无提交演练（详见
+[docs/CONTRACT_REHEARSAL.md](docs/CONTRACT_REHEARSAL.md)）：
+
+```bash
+npm run build
+env -u TICKET_AGENT_TOKEN -u TICKET_AGENT_CAPABILITY_KEY \
+  npm run start:runner -- --contract-rehearsal --confirm-rehearsal \
+  --plan /absolute/path/damai-contract-rehearsal-plan.json \
+  --contract /absolute/path/damai-fast-path-contract.json \
+  --url '必须与私有计划 officialUrl 完全相同的官方 HTTPS URL'
+```
+
+每轮必须输出脱敏 contract digest、固定证据计数/布尔结果、观察总价、`selectionReady=true`、
+`documentStable=true`、`zeroSubmit=true` 和 `fakeClickCount=0`；可逆选票动作不等于提交。第一轮出现
+页面拓扑/主文档变化、验证码、登录失效、selector/证据
+歧义或未知结果即停止，不跑后续轮次，不删除 profile/lock。三轮 digest 和活动/场次/票档/数量/观演人/
+总价证据全部一致后，仍需人工审核；本阶段不启动 controller、不领取 capability、不执行 `--live`，也不
+修改任何 readiness 开关。零提交模式只能审查 `postSubmitPredicates` 的 schema/selector 语法，不能证明
+真实订单号或待支付证据可见；该项继续作为上线 blocker。当前 contract/state machine 还要求选择、总价和
+submit-readiness 在同一 canonical page/document；若真实流程需要详情页到确认页的独立导航，必须回传
+`CONTRACT_REHEARSAL_DOCUMENT_CHANGED` 或 `CONTRACT_REHEARSAL_FINAL_ORIGIN_MISMATCH`，并等待维护者
+实现 versioned staged contract，不得靠猜 selector 绕过。
 
 ### 交接目标
 
@@ -112,7 +177,7 @@ verify_ticket_agent_origin
 
 ```bash
 git pull --ff-only origin main
-git merge-base --is-ancestor d0e8e77 HEAD
+git merge-base --is-ancestor d3d1963 HEAD
 git log -1 --oneline
 ```
 
@@ -130,7 +195,7 @@ case "$origin_url" in
   https://github.com/chaoyu-fan/ticket-agent|https://github.com/chaoyu-fan/ticket-agent.git) ;;
   *) echo "clone 后 origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
 esac
-git merge-base --is-ancestor d0e8e77 HEAD
+git merge-base --is-ancestor d3d1963 HEAD
 ```
 
 ### B. Mac 基础验收
@@ -154,7 +219,7 @@ npm --version
 
 - `setup-macos.sh` 的 Chrome、路径隔离和符号链接预检成功；该脚本不会创建 profile，runner 首次使用时才会安全创建并设为 `0700`；
 - `npm run check` 成功；
-- 当前基线（含 topology guard 回归）的测试应为 `279/279` 通过；
+- 当前基线（含 topology guard 与 contract-rehearsal 回归）的测试应为 `288/288` 通过；
 - `npm run smoke` 应为 `7/7` mock 场景通过。
 
 ### C. Mac 性能验收
@@ -326,6 +391,9 @@ default sandbox dry-run run 1: NOT_RUN | <state, observed total if present, zero
 default sandbox dry-run run 2: NOT_RUN | <state, observed total if present, zero-click confirmation>
 temporary sandbox A/B: NOT_RUN | <diagnostic result only; never substitutes for the two default runs>
 rehearsal: NOT_RUN | <state, zero-submit confirmation>
+contract-rehearsal run 1: NOT_RUN | <exit、outcome、reason、digest、活动/计数/观演人脱敏证据、selectionReady、documentStable、adjacentVerified、price、readiness、reversibleActionCount、zeroSubmit/fakeClickCount、postSubmitEvidence>
+contract-rehearsal run 2: NOT_RUN | <同上；digest 必须与 run 1 完全一致>
+contract-rehearsal run 3: NOT_RUN | <同上；digest 必须与 run 1/2 完全一致>
 liveReady / fastPathReady: false / false
 profile path isolation preflight: PASS | FAIL
 sandbox / live profile mode: 0700 | NOT_CREATED | FAIL / 0700 | NOT_CREATED | FAIL
@@ -335,7 +403,7 @@ raw benchmark JSON uploaded or added to repo: NO | YES
 blockers: <none or exact blocker>
 ```
 
-定义完成：仓库包含 `d0e8e77`，工作树干净，基础验收通过，topology guard 回归和 12 条基准命令全部返回 0、12 份报告结构和语义有效，
+定义完成：仓库包含当前功能检查点 `d3d1963`，工作树干净，基础验收通过，topology guard 回归和 12 条基准命令全部返回 0、12 份报告结构和语义有效，
 有固定性能门的三类基准全部过门，且 armed fast path 的六项 fault check 全为 1；`state-machine` 只记录三轮实测摘要。
 同一默认 sandbox 的两轮真实页 dry-run 还必须均为 `REVIEW_REQUIRED`、当前已知观测总价 `5800` 分、零点击，
 profile 为 `0700` 且无残留 runner lock；临时 profile PASS 不能替代。整个过程不得执行 rehearsal 或打开任何

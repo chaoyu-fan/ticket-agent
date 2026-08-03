@@ -132,7 +132,7 @@ fail-closed；dry-run/mock 永远不读取 Keychain。
 全部非终态 run 会在同一迁移事务中进入 `FAILED`。已有 `HELD` 购买锁不会自动释放，用户必须先核对
 官方订单；随后重新用 opaque refs 登记观演人并创建/武装安全计划。
 
-## 5. 无身份 selector 校准（无提交能力）
+## 5. Legacy selector 校准（无提交能力，不是 fast-path 验收）
 
 以下是后续 rehearsal 流程，不是当前基础复验指令。当前 HEAD 已在官方导航前安装 listener-first
 sticky topology guard，并用合成故障矩阵覆盖 popup/新页、原页关闭、context 关闭、初始多页和
@@ -158,7 +158,8 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 
 这里使用的仓库示例是无身份只读校准计划：`attendeeRefs`、`sessions` 和 `tiers` 都为空，且
 `autoSubmitOrder=false`。因此该命令不会读取 Keychain、不会选择观演人，也不能证明指定场次、票档、
-数量、预算和观演人的完整确认页演练已经通过。
+数量、预算和观演人的 legacy 确认页演练已经通过（仅表示可逆路径可达，不表示
+`postSubmitPredicates` 的真实订单/待支付证据已验证）。
 
 完整无提交 rehearsal 必须在 Mac 上另建不进入仓库的私有计划，至少包含用户批准的官方活动
 URL/ID、已核准活动标题、场次顺序、票档顺序、数量、明确 `maxTotalFen`、`PREFERRED_ORDER` 以及与
@@ -176,23 +177,86 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 只有这项私有计划演练才能校准并复核活动、场次、票档、数量、观演人、总价和 submit readiness；它仍
 没有 controller/capability，也不会提交订单。
 
-注意：当前 `rehearsal` 使用的是可逆的 legacy adapter 路径。即使它停在 `REVIEW_REQUIRED`，也不能
-证明尚未配置的 `FastPathContract` 在同一页面上可用；进入 live 前必须先生成脱敏、版本化的真实
-selector/evidence contract，并让无提交验收使用与 live 完全相同的 contract/digest。
+注意：`--rehearsal` 使用的是可逆的 legacy adapter 路径。即使它停在 `REVIEW_REQUIRED`，也不能
+证明尚未配置的 `FastPathContract` 在同一页面上可用；不得把它的结果写成 contract 验收通过。
 
-## 6. 获得大麦官方链接后
+## 6. Contract-driven selector/evidence 验收（无提交能力）
+
+Mac 已完成 `026c7f4` 增量回归并拉取至少包含 `d3d1963` 的最新 `main`（当前全量测试预期 `288/288`）后，
+下一阶段必须使用与未来 live 完全相同的版本化
+`FastPathContract`，而不是继续重复 legacy rehearsal。完整操作交接与本阶段证据清单见
+[CONTRACT_REHEARSAL.md](CONTRACT_REHEARSAL.md)。开始前必须由用户明确官方活动 URL/ID/准确标题、
+数量、最高总价、场次/票档优先顺序、连座要求和与数量一致的 opaque attendee refs；缺一即停止。
+
+仓库不提供自动 DOM/HTML 导出器或 selector 猜测器。Mac agent 只能在官方可见页面用 DevTools 或
+受控只读查询校准选择器，并把私有 plan 与 contract 放在仓库外、设为普通文件且 mode `0600`。
+计划只保存 opaque `attendeeRefs`，不能保存姓名或 `attendeeAliases`；运行时通过 Mac Keychain 解析，
+输出不得含 label、HTML、Cookie 或 URL query。contract 至少覆盖唯一活动身份、场次/票档/数量/观演人
+选择和 summary、可见价格/整数分属性、总价、连座、四类阻断态、全部不可逆控件、唯一 submit
+readiness 以及订单号/待支付的 post-submit predicate selectors（本阶段仅审查 schema/CSS 语法，
+不观察真实证据）。
+
+当前 contract/state machine 要求选择、总价和 submit-readiness 位于同一 canonical page/document。
+若真实大麦需要详情页到确认页的独立可逆导航，contract rehearsal 必须以
+`CONTRACT_REHEARSAL_DOCUMENT_CHANGED` 或 `CONTRACT_REHEARSAL_FINAL_ORIGIN_MISMATCH`
+fail-closed；不要用宽泛 selector、手工跳页或猜测继续。需要维护者先设计并审核 versioned staged
+contract，当前入口不会把这种流程标成通过。
+
+校准 plan 建议省略 `saleAt`。如果填写未来开售时间，Keychain resolver 在 T-10 窗口前会以
+`ATTENDEE_RESOLUTION_TOO_EARLY` 停止；未来 live plan 的准确带时区 `saleAt` 仍须单独配置和审核。
+
+只在 plan 和 contract 的 selection/submit-readiness 字段都经人工校准后，使用同一 live profile 连续
+运行三轮；`postSubmitPredicates` 此时只审查 schema/CSS 语法，第一轮失败立即停止：
+
+```bash
+set -e
+cd /Users/jakefan/ticket-agent
+umask 077
+report_dir="$(mktemp -d /private/tmp/ticket-agent-contract-rehearsal.XXXXXX)"
+chmod 700 "$report_dir"
+npm run build
+for run in 1 2 3; do
+  env -u TICKET_AGENT_TOKEN -u TICKET_AGENT_CAPABILITY_KEY \
+    npm run start:runner -- --contract-rehearsal --confirm-rehearsal \
+      --plan /absolute/path/damai-contract-rehearsal-plan.json \
+      --contract /absolute/path/damai-fast-path-contract.json \
+      --url '必须与私有计划 officialUrl 完全相同的官方 HTTPS URL' \
+      > "$report_dir/run-${run}.json"
+done
+```
+
+该入口不接 controller、不领取 capability、没有 submit 权限，也不会读取 `TICKET_AGENT_TOKEN` 或
+`TICKET_AGENT_CAPABILITY_KEY`。成功的三轮都必须为 `outcome=REVIEW_REQUIRED`、
+`reason=NO_SUBMIT_REHEARSAL_COMPLETE`、`zeroSubmit=true`、`fakeClickCount=0`、
+`selectionReady=true`、`documentStable=true`、`readiness.state=READY`、
+`postSubmitEvidence=NOT_OBSERVED`，要求连座时 `adjacentVerified=true`，contract `digest` 完全一致，且
+固定的活动/选择/提交就绪证据和唯一总价均一致且不超预算。可逆选择动作计数可以大于零；它不代表提交。
+出现 CAPTCHA、登录失效、官方域名/页面拓扑/主文档变化、selector 歧义、阻断态、残留 runner lock
+或任何未知结果时停止，绝不重试或删除 profile/lock。
+raw 输出只留在 Mac 私有 `/private/tmp`，只回传 README 规定的脱敏摘要。
+
+由于本入口强制零提交，`postSubmitPredicates` 只能通过 contract schema/selector 语法审查；它不能在
+当前页面证明真实订单号或待支付证据可见且唯一。这一项必须继续列为后续 blocker，不能用三轮
+`REVIEW_REQUIRED` 把它标成完成。
+
+三轮通过后仍保持 `liveReady=false / fastPathReady=false`，不得执行 `--live` 或自行把 contract 写入
+adapter。需要维护者复核 contract、digest、真实确认页证据、故障矩阵与用户最终预算/提交确认后，才可
+另行讨论 readiness 变更。
+
+## 7. 获得大麦官方链接后
 
 1. 把官方 HTTPS 活动链接、准确活动标题/ID 和开售时间写入计划。校准计划可先只绑定活动 ID；
    在真实标题 selector 审核通过前不要伪造 `eventTitle`，正式 live 计划必须同时绑定 ID 和标题。
 2. 先用 `dry-run` 做只读页面分析，记录实际可见的场次、票档、总价和页面状态；不提供账号密码、Cookie、身份证或支付信息。
 3. 根据真实页面更新并审核大麦 selector，完成页面改版、验证码、重定向和价格歧义测试。
-4. 用第 5 节所述本机私有计划执行完整 `rehearsal`，演练到订单确认页并核对活动、场次、票档、数量、
-   观演人和总价；仓库内无身份示例不能替代这一步。
-5. 设置明确的 `maxTotalFen`、场次优先级和票档优先级；生成版本化 fast-path contract，并确认 adapter
-   中的 contract digest 完全匹配。只有全量回归和 Mac 三轮性能门通过后，才允许同时将大麦
-   `liveReady` 与 `fastPathReady` 改为 `true`。
+4. 用第 5 节所述本机私有计划执行 legacy 可逆校准；它只能辅助到达确认页，仓库内无身份示例不能
+   替代真实约束，也不能作为 fast-path 验收。
+5. 设置明确的 `maxTotalFen`、场次优先级和票档优先级；生成版本化 fast-path contract，并按第 6 节
+   使用同一 contract/digest 连续完成三次无提交演练。
+6. 只有 contract 证据经维护者复核、全量回归和 Mac 三轮性能门通过后，才允许另行评审是否同时将
+   大麦 `liveReady` 与 `fastPathReady` 改为 `true`；Mac agent 不得自行修改。
 
-## 7. 真实执行时的强制条件
+## 8. 真实执行时的强制条件
 
 - `--live` 与 `--confirm-live` 同时出现；
 - 使用 `--controller-url http://127.0.0.1:4317` 和控制器生成的 `--run-id`；

@@ -14,8 +14,13 @@
 3. **仿真完成、真实 selector 待审核**：已确认低热度大麦活动 ID `1067493715985`；
    队列、验证码、登录失效、售罄、重定向、价格变化和页面改版全部 fail-closed，
    但当前真实页尚未映射到严格 DOM 契约。
-4. **调度仿真完成、真实演练待执行**：远期开售保持 `SCHEDULED`，进入 10 分钟预热窗口后等待 `saleAt`，官方队列仅同页串行轮询；仍需在用户 Mac 的本地登录会话中完成只读 selector 审核和确认页演练。
-5. **待完成**：猫眼独立适配器；复用安全接口，但不共享大麦选择器或账号会话。
+4. **调度仿真完成、contract-driven 无提交演练待执行**：远期开售保持 `SCHEDULED`，进入 10 分钟预热窗口后等待
+   `saleAt`，官方队列仅同页串行轮询；Mac 需先完成真实 selector/evidence 的只读校准，再用同一版本化
+   `FastPathContract` 连续三次运行 `--contract-rehearsal`。该模式没有 controller/capability/提交能力，
+   `postSubmitEvidence` 固定为 `NOT_OBSERVED`。
+5. **待完成**：真实订单号/待支付证据的确认页审核；若活动需要详情页到确认页的独立阶段，需先设计
+   versioned staged contract；大麦 readiness 继续关闭。
+6. **待完成**：猫眼独立适配器；复用安全接口，但不共享大麦选择器或账号会话。
 
 ## 为什么不把浏览器放在服务器
 

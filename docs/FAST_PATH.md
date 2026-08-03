@@ -74,8 +74,9 @@ mutation 时使用 16 ms 的一帧级本地 DOM fallback，不产生网络请求
 `data-ticket-agent-test-sink="browser-selection-v1"` 标记的无表单 `type=button`。点击过的选项若被页面
 替换、页面发生跳转或假点击结果不能被同步证明，任务立即失败关闭且绝不重试。
 
-它仍不是大麦实盘 selector 实现。Mac 无提交演练必须逐项校准并留存以下接口证据后，才能考虑由
-Damai adapter 调用：
+它仍不是大麦实盘 selector 实现。Mac 必须先用仓库外私有 plan/contract 做
+`--contract-rehearsal` 无提交校准（具体命令见 [docs/CONTRACT_REHEARSAL.md](CONTRACT_REHEARSAL.md)），
+逐项核对并留存以下接口证据后，才能考虑由 Damai adapter 调用：
 
 1. 实际购票页官方 origin、唯一活动标题和活动 ID 来源；
 2. 场次、票档、数量、观演人的 option、可见 label、selected marker 和可逆 click target；
@@ -83,8 +84,14 @@ Damai adapter 调用：
 4. 场次、票档、数量 summary、连座标记、唯一总价及整数分属性；
 5. CAPTCHA、登录、售罄、官方队列以及所有不可逆操作控件的选择器。
 
+contract rehearsal 的零提交报告只能证明 selection、唯一 submit-readiness 及 post-submit selector
+的 schema/CSS 语法；`postSubmitEvidence=NOT_OBSERVED`，不能证明真实订单号/待支付证据。当前状态机还
+要求这些选择与总价在同一 canonical page/document；详情页到确认页的独立阶段必须先设计 versioned
+staged contract，否则 fail-closed。
+
 在这些选择器通过真实页面只读校准和无提交演练前，`DamaiAdapter.liveReady` 与
-`DamaiAdapter.fastPathReady` 都继续为 `false`，contract 与 digest 也必须为空。
+`DamaiAdapter.fastPathReady` 都继续为 `false`，adapter-bound contract 与 digest 也必须为空；
+Mac 仓库外私有 contract 的存在不等于 adapter 已绑定或 live 已就绪。
 
 最终不可逆点击不会复用状态机中的 `HTMLElement.click()`：该事件为 `isTrusted=false`。
 `ArmedFastPath` 现在接收已驻留任务，Node 同步先烧毁 capability，再用一个最小 `evaluateHandle` 任务
