@@ -20,9 +20,9 @@ test("只接受规范化、非语义的 attendee UUIDv4 引用", () => {
 
   for (const unsafe of [
     "本人",
-    "张三",
-    "13800138000",
-    "110101199001011234",
+    "TEST_ATTENDEE_NAME",
+    "TEST_PHONE_00000000000",
+    "TEST_ID_DOCUMENT_000000000000000000",
     "person@example.com",
     "self-01",
     ` ${self}`,
@@ -74,7 +74,11 @@ test("审计序列化只输出数量和指纹，不输出原始引用", () => {
 });
 
 test("敏感观演人值无法进入审计，错误信息也不回显该值", () => {
-  const sensitiveValues = ["张三", "13800138000", "110101199001011234"];
+  const sensitiveValues = [
+    "TEST_ATTENDEE_NAME",
+    "TEST_PHONE_00000000000",
+    "TEST_ID_DOCUMENT_000000000000000000"
+  ];
 
   for (const sensitive of sensitiveValues) {
     let thrown: unknown;

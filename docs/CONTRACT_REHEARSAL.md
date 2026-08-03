@@ -1,6 +1,6 @@
 # 大麦 FastPathContract 校准与无提交交接
 
-本页是 Mac 已完成 `026c7f4` 增量回归后的下一步操作清单。它只验证当前官方页面的 selection 与
+本页是 Mac 拉取 `v0.1.0` 或更新版本并完成基础回归后的下一步操作清单。它只验证当前官方页面的 selection 与
 submit-readiness selector/evidence，并对 post-submit selector 做 schema/CSS 语法审查；不会领取
 controller capability、不会调用 `--live`，也不会点击提交/支付控件。
 
@@ -12,11 +12,9 @@ controller capability、不会调用 `--live`，也不会点击提交/支付控�
 
 ## 进入条件（缺一即停止）
 
-Mac agent 先确认 README 顶部增量路径已经回传成功：旧回归报告为 `HEAD=026c7f4`、工作树干净，随后按
-README 增量命令拉取至少包含 `d3d1963` 的最新 `main`，确认 `src/runner/contract-rehearsal.ts` 存在，并重新通过
-`npm run check`、当前全量测试 `288/288` 和 `npm run smoke` `7/7`，同时保持
-`liveReady=false / fastPathReady=false`。本阶段不需要重复四类 benchmark 或默认 sandbox dry-run；
-如果增量回归失败，回到 README 的 A–F 路径，不要继续本页。
+Mac agent 先按 [HANDOFF.md](HANDOFF.md) 完成安全拉取、macOS 预检、`npm run check`、全量测试和
+`npm run smoke`，确认工作树干净且 `liveReady=false / fastPathReady=false`。本阶段不需要重复四类
+benchmark；如果基础回归失败，立即停止，不要继续本页。
 
 用户还必须在开始真实页面校准前明确提供（不要让 agent 猜测）：
 
@@ -37,8 +35,12 @@ Keychain label 和支付信息不得进入终端、计划、contract、日志或
 umask 077
 mkdir -p "$HOME/Library/Application Support/TicketAgent/private"
 chmod 700 "$HOME/Library/Application Support/TicketAgent/private"
-chmod 600 /absolute/path/damai-contract-rehearsal-plan.json
-chmod 600 /absolute/path/damai-fast-path-contract.json
+plan_path=/absolute/path/damai-contract-rehearsal-plan.json
+contract_path=/absolute/path/damai-fast-path-contract.json
+# 先在本机编辑器中创建并填充两个文件；不要把它们放进仓库。
+[ -f "$plan_path" ] && [ ! -L "$plan_path" ]
+[ -f "$contract_path" ] && [ ! -L "$contract_path" ]
+chmod 600 "$plan_path" "$contract_path"
 ```
 
 `damai-contract-rehearsal-plan.json` 使用现有 WatchPlan JSON 结构，至少填入
@@ -190,7 +192,7 @@ Mac、同一 live profile、同一私有计划和同一 contract 上连续执行
 
 ```bash
 set -e
-cd /Users/jakefan/ticket-agent
+cd "${TICKET_AGENT_DIR:-$HOME/ticket-agent}"
 umask 077
 report_dir="$(mktemp -d /private/tmp/ticket-agent-contract-rehearsal.XXXXXX)"
 chmod 700 "$report_dir"

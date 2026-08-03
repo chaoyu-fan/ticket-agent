@@ -26,7 +26,7 @@ test("trusted-click benchmark accepts only its exact random numeric-loopback URL
     "https://127.0.0.1:43123/trusted-click-benchmark",
     "http://127.0.0.1:43123/benchmark",
     "http://127.0.0.1:43123/trusted-click-benchmark?next=https://damai.cn",
-    "http://user:pass@127.0.0.1:43123/trusted-click-benchmark",
+    "http://fixture-user:fixture-password@127.0.0.1:43123/trusted-click-benchmark",
     "https://detail.damai.cn/item.htm?id=1"
   ]) {
     assert.throws(() => assertTrustedClickBenchmarkUrl(blocked), /TRUSTED_CLICK_BENCHMARK_TARGET_BLOCKED/);

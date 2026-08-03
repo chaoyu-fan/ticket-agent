@@ -20,7 +20,7 @@ test("benchmark target policy accepts only the exact numeric-loopback page", () 
     "http://localhost:43123/benchmark",
     "http://127.0.0.1/benchmark",
     "https://127.0.0.1:43123/benchmark",
-    "http://user:pass@127.0.0.1:43123/benchmark",
+    "http://fixture-user:fixture-password@127.0.0.1:43123/benchmark",
     "http://127.0.0.1:43123/benchmark?url=https://damai.cn",
     "http://127.0.0.1:43123/other"
   ]) {

@@ -33,7 +33,9 @@ npm run --silent benchmark:loopback > loopback-performance.json
 每个阶段保留 500 个原始数字样本，并给出 nearest-rank `p50Ms`、`p95Ms`、`p99Ms`；
 `run_total` 还包含每轮一次 Playwright `page.evaluate` 的本机进程到浏览器往返。
 任一轮假点击数不是 1、页面发生导航、出现非 loopback 请求、报告含额外字段或超过性能门槛时，
-命令以非零状态退出。这个 JSON 可以回传；不要同时回传 Chrome profile、页面 HTML 或浏览器日志。
+命令以非零状态退出。原始 JSON 只保存在 Mac 的权限受限临时目录，不得回传、上传或提交；
+对外仅回传聚合的 `p50/p95/p99`、固定性能门结果和 fault-check 摘要。不要回传 Chrome profile、
+页面 HTML 或浏览器日志。
 
 ## 真实驻留状态机的隔离基准
 
@@ -93,7 +95,8 @@ handle 交接和一次可信 click 串成同一轮：
 npm run --silent benchmark:armed-fast-path > armed-fast-path-performance.json
 ```
 
-它固定预热 50 次并采样 500 次，报告以下六组 raw samples 与 nearest-rank p50/p95/p99：
+它固定预热 50 次并采样 500 次，在本机报告以下六组 raw samples 与 nearest-rank p50/p95/p99；
+raw samples 只留在本机，不得对外发送：
 
 - `browserSelectionLatencyMs`：resident 状态机报告的浏览器选择耗时；
 - `hotPathLatencyMs`：resident selection 返回固定证据后才开始，到最终 guard 结果回读结束；它不是

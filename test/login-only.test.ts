@@ -39,7 +39,7 @@ test("login-only target accepts only credential-free official Damai HTTPS URLs",
     "http://www.damai.cn/",
     "https://example.com/",
     "https://damai.cn.example.com/",
-    "https://user:secret@www.damai.cn/",
+    "https://fixture-user:fixture-password@www.damai.cn/",
     "https://www.damai.cn:444/"
   ]) {
     assert.throws(

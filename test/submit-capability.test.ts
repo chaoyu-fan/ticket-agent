@@ -48,7 +48,7 @@ function binding(overrides: Partial<SubmitCapabilityBinding> = {}): SubmitCapabi
     officialOrigin: "https://detail.damai.cn",
     finalOfficialOrigin: "https://buy.damai.cn",
     fastPathContractDigest: FAST_PATH_CONTRACT_DIGEST,
-    eventId: "1067493715985",
+    eventId: "event-fixture-1",
     eventTitle: "测试演出 上海站",
     quantity: 2,
     requireAdjacent: true,
@@ -106,7 +106,7 @@ function attempt(overrides: Partial<SubmitCapabilityAttempt> = {}): SubmitCapabi
     officialOrigin: "https://detail.damai.cn",
     finalOfficialOrigin: "https://buy.damai.cn",
     fastPathContractDigest: FAST_PATH_CONTRACT_DIGEST,
-    eventId: "1067493715985",
+    eventId: "event-fixture-1",
     eventTitle: "测试演出 上海站",
     quantity: 2,
     requireAdjacent: true,
@@ -153,7 +153,7 @@ test("capability signs every approved event and selection bound without sensitiv
   assert.equal(claims.officialOrigin, "https://detail.damai.cn");
   assert.equal(claims.finalOfficialOrigin, "https://buy.damai.cn");
   assert.equal(claims.fastPathContractDigest, FAST_PATH_CONTRACT_DIGEST);
-  assert.equal(claims.eventId, "1067493715985");
+  assert.equal(claims.eventId, "event-fixture-1");
   assert.equal(claims.eventTitle, "测试演出 上海站");
   assert.equal(claims.quantity, 2);
   assert.equal(claims.requireAdjacent, true);
@@ -191,7 +191,7 @@ test("official origin is canonical HTTPS and platform scoped", () => {
     "https://detail.damai.cn/item.htm?id=1",
     "https://damai.cn.example.com",
     "https://www.maoyan.com",
-    "https://user:pass@detail.damai.cn",
+    "https://fixture-user:fixture-password@detail.damai.cn",
     "https://detail.damai.cn:444"
   ]) {
     expectCode(() => canonicalOfficialOrigin("damai", invalid), "SUBMIT_CAPABILITY_INPUT_INVALID");

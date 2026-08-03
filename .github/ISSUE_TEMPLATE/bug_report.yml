@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible fail-closed, mock, build, or documentation problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste credentials, cookies, identity/payment data, Keychain values, Chrome profiles,
+        private contracts, raw benchmark JSON, or complete page HTML. Security issues belong in a
+        private vulnerability report.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Build / check / unit test
+        - Mock / smoke
+        - Dry-run (zero click)
+        - Documentation
+        - Other safe local path
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and minimal reproduction
+      description: Redact URLs, query strings, identities, tokens, and local profile paths.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS version, Node.js version, npm version, Chrome version if relevant
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I did not run live purchasing or bypass platform verification/risk controls.
+          required: true
+        - label: This report contains no secrets, identity/payment data, cookies, or private page data.
+          required: true

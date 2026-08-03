@@ -254,7 +254,7 @@ test("runner mode is explicit and live mode requires a second confirmation", () 
 });
 
 test("rehearsal requires its own confirmation and excludes live/controller capabilities", () => {
-  const planPath = "examples/damai-iwwf-readonly-plan.json";
+  const planPath = "examples/damai-readonly-plan.json";
   assert.throws(() => parseRunnerArgs(["--rehearsal", "--plan", planPath]), /confirm-rehearsal/);
   assert.equal(
     parseRunnerArgs(["--rehearsal", "--confirm-rehearsal", "--plan", planPath]).mode,

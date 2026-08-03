@@ -5,7 +5,7 @@
 安装 Node.js 22.13+ 和 Google Chrome，将项目复制到 Mac 后执行：
 
 ```bash
-npm ci
+npm ci --ignore-scripts
 bash scripts/setup-macos.sh
 npm run check
 npm test
@@ -70,29 +70,28 @@ npm run start:runner -- --dry-run --plan examples/default-damai-plan.json
 
 预期结果是 `REVIEW_REQUIRED`，且没有浏览器、网络请求或点击。
 
-已经确认可访问的低热度校准活动使用独立计划，不覆盖通用默认计划。profile 生命周期修复后必须在同一个
-默认 sandbox 中顺序运行两次；第一轮未通过时停止：
+公开示例只用于说明字段，不能直接作为真实页面计划。把它复制到仓库外的私有目录、设为 `0600`，
+再由用户填入目标活动的官方 URL/ID；不要提交这个副本：
 
 ```bash
+umask 077
+private_plan=/absolute/path/damai-private-readonly-plan.json
+cp examples/damai-readonly-plan.json "$private_plan"
+chmod 600 "$private_plan"
+# 在本机编辑 private_plan，把 EVENT_ID URL/ID 占位符替换为用户提供的官方目标。
+
 npm run build
-
 env -u TICKET_AGENT_SANDBOX_PROFILE \
   npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
-
-env -u TICKET_AGENT_SANDBOX_PROFILE \
-  npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
+  --plan "$private_plan"
 ```
 
-该计划绑定大麦活动 ID `1067493715985`，固定为一张、最低价优先且
-`autoSubmitOrder=false`。一般 selector 校准可能以 `PAGE_CHANGED` 或“缺少唯一订单总价”停止；详情页尚未
-进入选票/确认页时不代表链接失效。但本轮默认 profile 修复验收要求两轮均为 `REVIEW_REQUIRED`、当前已知
-观测总价 `5800` 分并确认零选票/零提交点击。两轮之间不得删除、迁移、替换或清理默认 sandbox；临时
-profile PASS 不能替代。任一轮出现 `BROWSER_CONTEXT_CLOSED`、`SINGLE_PAGE_CONTEXT_REQUIRED` 或 raw/legacy
-Target-closed 错误都应停止，且不得继续 rehearsal/live。`dry-run` 只读取官方页面控件，不点击“立即购票”、
-场次、票档、数量、观演人或提交控件。两轮结束后，默认 sandbox 必须仍为 `0700`，默认 sandbox/live
-profile 都不得残留 `.ticket-agent.runner.lock`；只读检查方法以 README D 节为准，发现 lock 时不得自动删除。
+示例固定为一张、最低价优先且 `autoSubmitOrder=false`。一般 selector 校准可能以 `PAGE_CHANGED` 或
+“缺少唯一订单总价”停止；详情页尚未进入选票/确认页时不代表链接失效。出现
+`BROWSER_CONTEXT_CLOSED`、`SINGLE_PAGE_CONTEXT_REQUIRED` 或 raw/legacy Target-closed 错误时停止，
+不得继续 rehearsal/live。`dry-run` 只读取官方页面控件，不点击“立即购票”、场次、票档、数量、
+观演人或提交控件。运行后 profile 必须仍为 `0700` 且不得残留 `.ticket-agent.runner.lock`；发现 lock
+时不得自动删除。
 
 ## 3. 初始化 live 专用登录会话
 
@@ -143,8 +142,8 @@ dispose 清理；在真实 selector/确认页 contract、用户私有约束和�
 ```bash
 npm run build
 npm run start:runner -- --rehearsal --confirm-rehearsal \
-  --plan examples/damai-iwwf-readonly-plan.json \
-  --url 'https://detail.damai.cn/item.htm?id=1067493715985'
+  --plan /absolute/path/damai-private-readonly-plan.json \
+  --url 'https://detail.damai.cn/item.htm?id=EVENT_ID'
 ```
 
 `rehearsal` 只接受与计划一致的大麦官方 HTTPS 活动地址。它不连接控制器，不接受
@@ -182,8 +181,8 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 
 ## 6. Contract-driven selector/evidence 验收（无提交能力）
 
-Mac 已完成 `026c7f4` 增量回归并拉取至少包含 `d3d1963` 的最新 `main`（当前全量测试预期 `288/288`）后，
-下一阶段必须使用与未来 live 完全相同的版本化
+Mac 拉取 `v0.1.0` 或更新版本、完成 [HANDOFF.md](HANDOFF.md) 的基础回归后，下一阶段必须使用
+与未来 live 完全相同的版本化
 `FastPathContract`，而不是继续重复 legacy rehearsal。完整操作交接与本阶段证据清单见
 [CONTRACT_REHEARSAL.md](CONTRACT_REHEARSAL.md)。开始前必须由用户明确官方活动 URL/ID/准确标题、
 数量、最高总价、场次/票档优先顺序、连座要求和与数量一致的 opaque attendee refs；缺一即停止。
@@ -210,7 +209,7 @@ contract，当前入口不会把这种流程标成通过。
 
 ```bash
 set -e
-cd /Users/jakefan/ticket-agent
+cd "${TICKET_AGENT_DIR:-$HOME/ticket-agent}"
 umask 077
 report_dir="$(mktemp -d /private/tmp/ticket-agent-contract-rehearsal.XXXXXX)"
 chmod 700 "$report_dir"
@@ -264,7 +263,7 @@ adapter。需要维护者复核 contract、digest、真实确认页证据、故�
 - plan 必须包含带明确时区的 `saleAt`；它同时作为一次性 capability 的签名最早提交时间；
 - plan 必须显式使用 `PREFERRED_ORDER`，包含非空场次/票档顺序、观演人 refs 和 `maxTotalFen`；
 - adapter 的 `liveReady`、`fastPathReady`、contract 和 contract digest 四者同时通过；
-- 默认 sandbox 两轮 dry-run、启动生命周期修复和合成性能基准都不能替代真实 selector 与确认页 contract
+- sandbox dry-run、启动生命周期修复和合成性能基准都不能替代真实 selector 与确认页 contract
   审核；导航前 sticky topology guard 已作为代码/回归门接入，但仍需在 Mac 基础回归中确认版本一致；不得
   仅凭这些结果解除 readiness；
 - 浏览器 resident ACK 成功后，controller 才在首次 capability delivery 事务中取得活动购买锁；

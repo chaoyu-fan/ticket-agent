@@ -23,7 +23,7 @@ test("state-machine benchmark target accepts only its exact random numeric-loopb
     "https://127.0.0.1:43123/state-machine-benchmark",
     "http://127.0.0.1:43123/benchmark",
     "http://127.0.0.1:43123/state-machine-benchmark?next=https://damai.cn",
-    "http://user:pass@127.0.0.1:43123/state-machine-benchmark",
+    "http://fixture-user:fixture-password@127.0.0.1:43123/state-machine-benchmark",
     "https://detail.damai.cn/item.htm?id=1"
   ]) {
     assert.throws(() => assertStateMachineBenchmarkUrl(blocked), /STATE_MACHINE_BENCHMARK_TARGET_BLOCKED/);

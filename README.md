@@ -1,499 +1,117 @@
 # Ticket Agent
 
-个人购票辅助智能体，大麦优先、猫眼随后接入。它只通过官方网页的可见控件工作；遇到验证码、风控、登录异常、未知页面或支付确认时停止并交给用户。
+大麦优先、猫眼预留的 macOS 本地购票辅助智能体。它只通过官方网页的可见控件工作；遇到
+验证码、风控、登录异常、价格/页面歧义、未知提交结果或支付确认时停止并交给用户。
 
-## 给 macOS Agent 的交接（从这里开始）
+> **公开冻结版 `v0.1.0`（2026-08-03）**
+>
+> 当前 `liveReady=false`、`fastPathReady=false`。真实大麦 selector 和确认页 contract 尚未
+> 完成维护者审核，猫眼适配器继续 fail-closed。本版本不是可直接用于无人值守抢票或自动
+> 支付的成品，合成 benchmark 也不代表真实库存、排队、风控或购票成功率。
 
-如果你是在用户 Mac 上接手本仓库的 agent，当前任务不是立即实盘下单，而是先验收已推送的
-常驻低延迟快路径，再进行无提交的真实大麦页面校准。当前功能检查点为 `d3d1963`（包含导航前
-sticky page-topology guard 与 contract-driven 无提交演练入口）；文档提交可能使 `main` 的 HEAD 更新，
-但当前 `main` 必须至少包含该检查点。仓库固定为
-`https://github.com/chaoyu-fan/ticket-agent.git` 的 `main` 分支。
+English summary: a local, fail-closed macOS browser assistant for official ticketing pages. The
+public release is not live-ready and does not bypass CAPTCHA, identity checks, risk controls, or
+payment confirmation.
 
-当前 HEAD 还包含导航前的 sticky page-topology guard：它在官方导航前先监听
-context 的 `page` 事件、原页 `close` 和 context `close`，并持续校验唯一 canonical page 的对象身份；任何
-popup/新页、原页关闭、context 关闭或页面集合变化都会粘滞 abort，即使 popup 随后关闭也不会恢复。
-`rehearsal` 和 `live` 复用同一个 guard 实例，`LocalRunner` 会把拓扑变化归一化为
-状态 `PAGE_CHANGED`、消息 `PAGE_TOPOLOGY_INVALID:<phase>`；live fast path 的异常消息为
-`LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID`。guard 的合成故障矩阵和生命周期清理已有回归测试。
-CLI 是官方 rehearsal/live 入口；直接调用 `LocalRunner` 的库集成也应自行传入同一类 guard。这只证明
-代码层面的零点击防线，不等于真实大麦 selector、确认页 contract 或 `liveReady` 已审核。
+## 当前能力
 
-### 已完成 `763124c` 验收时的增量路径
+- 大麦适配器骨架和猫眼 fail-closed 占位，二者不共享 selector 或账号会话；
+- 活动/官方域名绑定、明确预算、场次/票档/数量/观演人证据和不可变价格快照；
+- 单实例 profile 锁、跨平台重复购买锁、一次性提交 capability 和未知结果不重试；
+- 导航前 sticky page-topology guard，以及 popup/新页/原页关闭/context 关闭的零点击阻断；
+- macOS live/sandbox Chrome profile 隔离，opaque attendee refs 只在本地 Keychain 解析；
+- contract-driven 无提交演练、脱敏报告、mock smoke 和本地延迟基准。
 
-只有 Mac 已回传 `HEAD=763124c`、工作树干净、`269/269`、`smoke 7/7`、四类 benchmark 三轮通过，且
-默认 sandbox 两次 dry-run 都是 `REVIEW_REQUIRED / 5800 分 / 零点击` 时，才使用本节；否则执行后面的
-完整 A–F。增量复验不重复 benchmark 或真实页 dry-run，因为本次只增加官方模式的冷路径 topology guard，
-并且 dry-run 不启用该 guard：
+## 明确边界
 
-```bash
-set -e
-cd /Users/jakefan/ticket-agent
-[ -z "$(git status --short)" ] || { git status --short; exit 1; }
-[ "$(git branch --show-current)" = main ] || exit 1
-origin_url="$(git remote get-url origin)"
-case "${origin_url%/}" in
-  https://github.com/chaoyu-fan/ticket-agent.git|https://github.com/chaoyu-fan/ticket-agent|\
-  git@github.com:chaoyu-fan/ticket-agent.git|git@ssh.github.com:chaoyu-fan/ticket-agent.git) ;;
-  *) echo "origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
-esac
-git pull --ff-only origin main
-git merge-base --is-ancestor 763124c HEAD
-npm ci --ignore-scripts
-bash scripts/setup-macos.sh
-npm run check
-TMPDIR=/private/tmp npm test
-npm run smoke
-git status --short
-```
+本项目不实现私有 API 逆向、验证码或人脸验证破解、代理池、多账号并发、设备指纹伪造、
+平台限购绕过或自动支付。登录、短信/人脸验证、验证码和支付必须由用户本人在可见 Chrome
+中完成。页面或价格不明确时，正确结果是停止，而不是猜测点击。
 
-预期 `279/279` 和 `7/7`；`git status --short` 必须为空。只回传新 HEAD、上述三项结果、
-`liveReady=false / fastPathReady=false`、未执行 rehearsal/live、未持久化或上传秘密。任何失败都停止，
-不得 `reset`、`clean`、删除 profile/lock 或用旧报告覆盖新失败。
+请先确认当地法律、目标平台条款和活动规则允许你的使用方式。库存和官方队列由平台控制，
+本项目不保证取得门票。
 
-**不满足增量路径前置条件时，本轮只执行 A–D、遵守 E，并按 F 回传。** 完成后必须停止并回传报告；不要启动 controller、创建或武装实盘计划，
-不要执行 `rehearsal` 或 `--live`，也不要自行修改 readiness 开关。本节后面的 rehearsal/controller/live 说明只是后续设计文档，
-不是本轮执行指令。
+## 快速开始
 
-### 增量回归之后的下一步（contract-driven、仍无提交）
-
-Mac 已回传 `HEAD=026c7f4`、`279/279`、`smoke 7/7` 且 `liveReady=false / fastPathReady=false` 后，先拉取
-包含 contract-rehearsal 入口的最新 `main`，重新完成该增量代码回归（当前预期全量测试 `288/288`、`smoke 7/7`），
-再进入真实大麦 selector/evidence 校准。只执行以下增量回归，不重复 benchmark、默认 sandbox dry-run、legacy
-rehearsal 或 live：
+要求 Node.js 22.13 或更高版本。以下命令只构建代码并访问测试/mock/loopback，不会登录、
+选票、提交订单或读取 Keychain：
 
 ```bash
-set -e
-cd /Users/jakefan/ticket-agent
-[ -z "$(git status --short)" ] || { git status --short; exit 1; }
-[ "$(git branch --show-current)" = main ] || { echo '当前分支不是 main' >&2; exit 1; }
-origin_url="$(git remote get-url origin)"
-case "${origin_url%/}" in
-  https://github.com/chaoyu-fan/ticket-agent|https://github.com/chaoyu-fan/ticket-agent.git|\
-  git@github.com:chaoyu-fan/ticket-agent.git|git@ssh.github.com:chaoyu-fan/ticket-agent.git) ;;
-  *) echo "origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
-esac
-git pull --ff-only origin main
-git merge-base --is-ancestor d3d1963 HEAD
-[ -f src/runner/contract-rehearsal.ts ] || { echo 'contract-rehearsal entry missing' >&2; exit 1; }
-npm ci --ignore-scripts
-bash scripts/setup-macos.sh
-npm run check
-TMPDIR=/private/tmp npm test
-npm run smoke
-[ -z "$(git status --short)" ]
-```
-
-通过后保持 `liveReady=false / fastPathReady=false` 并回传新 HEAD、`288/288`、`7/7`；失败即停止。
-然后再向用户收集官方活动 URL/ID/准确标题、数量、`maxTotalFen`、场次和票档
-优先顺序、连座要求及 Mac 本地 opaque 观演人 refs；不完整时停止，不猜测字段。
-
-仓库没有自动 DOM/HTML 导出器或 selector 猜测器。Mac agent 只能在官方可见页面上用 DevTools 或受控的
-只读查询逐项核对 selector 的唯一性、可见性、selected marker、价格整数分和阻断态，并把结果写入仓库外
-权限为 `0600` 的私有 `FastPathContract` 文件。旧的 `--rehearsal` 是 legacy adapter 路径，即使返回
-`REVIEW_REQUIRED` 也不能证明 fast path contract 可用。校准 plan 建议省略 `saleAt`；若填写未来时间，
-T-10 前解析 Keychain 会按设计停止（`ATTENDEE_RESOLUTION_TOO_EARLY`），正式 live 的带时区 `saleAt`
-需另行审核。
-
-contract 的 selection/submit-readiness 字段和同样为 `0600` 的私有 rehearsal plan 完成手工校准后，
-使用新入口在同一 live profile 上连续三次无提交演练（详见
-[docs/CONTRACT_REHEARSAL.md](docs/CONTRACT_REHEARSAL.md)）：
-
-```bash
-npm run build
-env -u TICKET_AGENT_TOKEN -u TICKET_AGENT_CAPABILITY_KEY \
-  npm run start:runner -- --contract-rehearsal --confirm-rehearsal \
-  --plan /absolute/path/damai-contract-rehearsal-plan.json \
-  --contract /absolute/path/damai-fast-path-contract.json \
-  --url '必须与私有计划 officialUrl 完全相同的官方 HTTPS URL'
-```
-
-每轮必须输出脱敏 contract digest、固定证据计数/布尔结果、观察总价、`selectionReady=true`、
-`documentStable=true`、`zeroSubmit=true` 和 `fakeClickCount=0`；可逆选票动作不等于提交。第一轮出现
-页面拓扑/主文档变化、验证码、登录失效、selector/证据
-歧义或未知结果即停止，不跑后续轮次，不删除 profile/lock。三轮 digest 和活动/场次/票档/数量/观演人/
-总价证据全部一致后，仍需人工审核；本阶段不启动 controller、不领取 capability、不执行 `--live`，也不
-修改任何 readiness 开关。零提交模式只能审查 `postSubmitPredicates` 的 schema/selector 语法，不能证明
-真实订单号或待支付证据可见；该项继续作为上线 blocker。当前 contract/state machine 还要求选择、总价和
-submit-readiness 在同一 canonical page/document；若真实流程需要详情页到确认页的独立导航，必须回传
-`CONTRACT_REHEARSAL_DOCUMENT_CHANGED` 或 `CONTRACT_REHEARSAL_FINAL_ORIGIN_MISMATCH`，并等待维护者
-实现 versioned staged contract，不得靠猜 selector 绕过。
-
-### 交接目标
-
-1. 安全地拉取最新 `main`，不覆盖 Mac 上任何未提交改动。
-2. 在 Mac 的真实 Google Chrome 环境通过构建、全量测试、mock smoke 和四类性能基准。
-3. 只在上述验收通过后，使用默认 sandbox 连续执行两次大麦真实页 `dry-run`；本轮不执行 `rehearsal`。
-4. 把规定的脱敏证据回传给用户；不得将 Cookie、姓名、证件、Chrome profile 或页面 HTML 上传到 GitHub。
-
-### A. 拉取前检查
-
-默认 Mac 项目目录是 `/Users/jakefan/ticket-agent`。如果目录已存在：
-
-```bash
-set -e
-cd /Users/jakefan/ticket-agent
-if [ -n "$(git status --short)" ]; then
-  echo '工作树有未提交改动，停止：' >&2
-  git status --short
-  exit 1
-fi
-branch="$(git branch --show-current)"
-if [ "$branch" != main ]; then
-  echo "当前分支不是 main：$branch" >&2
-  exit 1
-fi
-verify_ticket_agent_origin() {
-  local raw normalized
-  raw="$(git remote get-url origin 2>/dev/null)" || {
-    echo 'origin 缺失或不可读取' >&2
-    return 1
-  }
-  normalized="${raw%/}"
-  normalized="${normalized%.git}"
-  case "$normalized" in
-    https://github.com/chaoyu-fan/ticket-agent|\
-    https://github.com:443/chaoyu-fan/ticket-agent|\
-    git@github.com:chaoyu-fan/ticket-agent|\
-    git@ssh.github.com:chaoyu-fan/ticket-agent|\
-    ssh://git@github.com/chaoyu-fan/ticket-agent|\
-    ssh://git@github.com:22/chaoyu-fan/ticket-agent|\
-    ssh://git@github.com:443/chaoyu-fan/ticket-agent|\
-    ssh://git@ssh.github.com:443/chaoyu-fan/ticket-agent)
-      echo "origin 已验证：$raw"
-      ;;
-    *)
-      echo "origin 不是 ticket-agent GitHub 仓库：$raw" >&2
-      return 1
-      ;;
-  esac
-}
-verify_ticket_agent_origin
-```
-
-只有工作树为空、当前分支为 `main` 且上述校验确认 `origin` 指向 `ticket-agent` 仓库时才继续；已有合法 SSH origin 不需要改写。
-如果有任何改动，或任一检查失败，
-不要执行 `reset`、`clean`、`checkout --` 或覆盖文件；立即停止并向用户报告具体输出。全部通过后执行：
-
-```bash
-git pull --ff-only origin main
-git merge-base --is-ancestor d3d1963 HEAD
-git log -1 --oneline
-```
-
-`git merge-base` 必须返回 0。如果项目目录不存在，才执行全新 clone：
-
-```bash
-set -e
-cd /Users/jakefan
 git clone https://github.com/chaoyu-fan/ticket-agent.git
 cd ticket-agent
-branch="$(git branch --show-current)"
-[ "$branch" = main ] || { echo "clone 后当前分支不是 main：$branch" >&2; exit 1; }
-origin_url="$(git remote get-url origin)"
-case "$origin_url" in
-  https://github.com/chaoyu-fan/ticket-agent|https://github.com/chaoyu-fan/ticket-agent.git) ;;
-  *) echo "clone 后 origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
-esac
-git merge-base --is-ancestor d3d1963 HEAD
-```
-
-### B. Mac 基础验收
-
-前置条件是 macOS、Node.js `22.13+` 和已安装的 Google Chrome。不要使用日常 Chrome profile，不要将账号密码、
-Cookie、身份证号或支付信息写入终端、计划文件或仓库。按顺序执行：
-
-```bash
 npm ci --ignore-scripts
-bash scripts/setup-macos.sh
-npm run check
-TMPDIR=/private/tmp npm test
-npm run smoke
-sw_vers -productVersion
-node --version
-npm --version
-"${TICKET_AGENT_CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" --version
-```
-
-验收标准：
-
-- `setup-macos.sh` 的 Chrome、路径隔离和符号链接预检成功；该脚本不会创建 profile，runner 首次使用时才会安全创建并设为 `0700`；
-- `npm run check` 成功；
-- 当前基线（含 topology guard 与 contract-rehearsal 回归）的测试应为 `288/288` 通过；
-- `npm run smoke` 应为 `7/7` mock 场景通过。
-
-### C. Mac 性能验收
-
-四类基准各连续执行三轮，每轮固定 50 次预热和 500 次正式采样：
-
-```bash
-set -e
-bench_dir="$(mktemp -d /private/tmp/ticket-agent-bench.XXXXXX)"
-
-for run in 1 2 3; do
-  npm run --silent benchmark:loopback \
-    > "$bench_dir/loopback-performance-$run.json"
-  npm run --silent benchmark:state-machine \
-    > "$bench_dir/state-machine-performance-$run.json"
-  npm run --silent benchmark:trusted-click \
-    > "$bench_dir/trusted-click-performance-$run.json"
-  npm run --silent benchmark:armed-fast-path \
-    > "$bench_dir/armed-fast-path-performance-$run.json"
-done
-
-git status --short
-```
-
-所有命令必须返回 0。`armed-fast-path` 的三份报告还必须满足：
-
-- `sampleIterations=500`；
-- `exactTargetBound`、`priceChanged`、`evidenceChangedAfterHandle`、`detachedHandle`、
-  `obscuredTarget`、`disabledTarget` 六项 `faultChecks` 全部为 `1`；
-- hot path p95/p99 不超过 `100/125 ms`；
-- trusted click p95/p99 不超过 `75/100 ms`；
-- `t0ToTrustedClickLatencyMs` p95/p99 不超过 `125/150 ms`。
-
-`loopback`、`trusted-click` 和 `armed-fast-path` 命令会在进程内校验各自的固定性能门；`state-machine`
-只校验封闭报告结构和状态机语义，没有人为设定的固定延迟门，因此只记录三轮实测摘要，不宣称“过性能门”。
-这些 JSON 只保存在 Mac 的私有 `/private/tmp` 临时目录，不得复制进仓库或整份上传。最后的
-`git status --short` 必须仍为空。报告只回传下面 F 节要求的聚合值；合成结果不能解释为真实大麦购票成功率。
-
-### D. 真实大麦页面的无提交校准
-
-只有 A–C 全部通过后才能执行本阶段。使用同一个默认 sandbox profile 顺序运行两次零点击
-`dry-run`；第一轮未通过时停止，不执行第二轮：
-
-```bash
-npm run build
-
-env -u TICKET_AGENT_SANDBOX_PROFILE \
-  npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
-
-env -u TICKET_AGENT_SANDBOX_PROFILE \
-  npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
-```
-
-该例只用于低热度页面身份和 selector 校准。它的 `attendeeRefs`、`sessions` 和 `tiers` 为空，
-`autoSubmitOrder=false`，不读 Keychain、不选观演人、不提交订单。停在 `PAGE_CHANGED` 或缺少唯一总价可以是预期的
-校准结果。本轮 profile 生命周期修复的验收则更严格：两轮都必须是 `REVIEW_REQUIRED`、当前已知观测总价
-`5800` 分且零选票/零提交点击。两轮之间不得删除、迁移、重命名或替换默认 sandbox profile，也不得手工
-清理其会话文件；临时 sandbox profile 的成功结果只能用于诊断，不能替代这两轮默认 profile 验收。
-
-为避免 Chrome 唯一恢复页自行关闭并带走整个 context，runner 会在首次目标导航前创建自己拥有的新页，
-再按模式处理恢复页：
-
-- `dry-run` / `mock` 使用无提交 sandbox；初始 0/1 页时创建 fresh page，并可关闭唯一恢复页；初始多页
-  不清理并 fail-closed。
-- `rehearsal` / `live` 使用 live profile；只替换唯一 `about:blank`，唯一非空恢复页会报
-  `RESTORED_PAGE_REVIEW_REQUIRED` 并原样保留，初始多页也 fail-closed。
-- `login-only` 保留全部恢复页，只另开一个人工登录页，不在旧页执行自动操作。
-
-关闭唯一 sandbox 恢复页会改变 Chrome 的恢复标签列表，但代码不会删除 profile 目录，也不会主动清除
-Cookie、localStorage、Keychain 或登录数据。当前 readiness 仍关闭；上述 live 策略不是本轮实盘授权。
-
-如果用户明确要求准备登录，agent 只负责打开 live 专用可见 Chrome；账号、密码、短信或人脸验证均由用户本人在
-浏览器里完成，不得让用户粘贴到终端或聊天。完成登录后由用户关闭浏览器，或在终端按 `Ctrl-C`：
-
-```bash
-npm run start:runner -- --login-only \
-  --platform damai \
-  --url https://www.damai.cn/
-```
-
-`login-only` 不读取计划、不选择票档且没有下单能力。它保留恢复标签并等待整个 TicketAgent 浏览器关闭；
-只关闭新开的登录标签时，若仍有其他恢复页，runner 和 profile lock 会继续等待。本轮即使登录完成也不得执行
-`rehearsal`：导航前 sticky topology guard 的代码生命周期已经覆盖并通过合成回归，但当前没有用户批准的
-真实 selector/确认页 contract、`maxTotalFen`、场次/票档顺序和数量。待用户提供这些约束、Mac 生成脱敏
-selector 证据并收到单独执行指令后，才按
-[docs/MACOS.md](docs/MACOS.md) 的无提交流程演练。没有用户明确提供的 `maxTotalFen`、场次/票档顺序、数量
-和 Mac 本地私有计划时，不得猜测或补造这些字段。遇到 CAPTCHA、短信/人脸验证、登录异常、页面改版或跳出
-官方域名时，停止并交给用户，不得尝试绕过。
-
-runner 执行后只核对已实际创建的 profile 权限；`NOT_CREATED` 不是失败，表示本轮没有使用该 profile：
-
-```bash
-set -e
-check_profile_mode() {
-  # In zsh, `path` is tied to PATH; do not use it as a local variable.
-  local label="$1" profile_dir="$2" mode
-  if [ -L "$profile_dir" ] || { [ -e "$profile_dir" ] && [ ! -d "$profile_dir" ]; }; then
-    echo "$label: FAIL"
-    return 1
-  fi
-  if [ ! -e "$profile_dir" ]; then
-    echo "$label: NOT_CREATED"
-    return 0
-  fi
-  mode="$(/usr/bin/stat -f '%OLp' "$profile_dir")" || { echo "$label: FAIL"; return 1; }
-  [ "$mode" = 700 ] || { echo "$label: FAIL(mode=$mode)"; return 1; }
-  echo "$label: 700"
-}
-check_profile_lock_absent() {
-  local label="$1" profile_dir="$2" lock_file
-  lock_file="$profile_dir/.ticket-agent.runner.lock"
-  if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
-    echo "$label lock: FAIL(present)"
-    return 1
-  fi
-  echo "$label lock: ABSENT"
-}
-profile_status=0
-default_sandbox_profile="$HOME/Library/Application Support/TicketAgent/SandboxChromeProfile"
-default_live_profile="$HOME/Library/Application Support/TicketAgent/ChromeProfile"
-check_profile_mode sandbox "$default_sandbox_profile" || profile_status=1
-check_profile_mode live "$default_live_profile" || profile_status=1
-check_profile_lock_absent sandbox "$default_sandbox_profile" || profile_status=1
-check_profile_lock_absent live "$default_live_profile" || profile_status=1
-git status --short
-exit "$profile_status"
-```
-
-凡已创建的默认 profile，mode 必须为 `700`，两个默认 profile 的 runner lock 都必须为 `ABSENT`；最终
-`git status --short` 必须为空。这里只读检查 lock，绝不自动删除。
-
-如果任一默认 sandbox dry-run 出现 `PAGE_CHANGED` 且消息包含
-`BROWSER_CONTEXT_CLOSED:<phase>`、`SINGLE_PAGE_CONTEXT_REQUIRED`，或出现 legacy/raw
-`RUNNER_FAILED:...Target page, context or browser has been closed`，即使命令退出码为 0 也不算通过。保留脱敏
-状态、阶段和错误类别后停止；不要继续 `rehearsal` 或 `--live`，不要删除/迁移默认 profile、Cookie、
-登录态或未知归属的 profile lock，也不要用临时 profile 的既有 PASS 把本轮标成完成。只有默认 profile
-失败且维护者明确要求定位时，才可再次使用临时 sandbox A/B；其结果只用于诊断。
-
-### E. 必须保持的禁止项
-
-- 不得把大麦 `liveReady` 或 `fastPathReady` 改为 `true`；猫眼也继续 fail-closed。
-- 本轮不得执行 `rehearsal`；虽然导航前 sticky topology guard 已完成代码和合成故障验收，真实活动
-  selector/确认页 contract、预算和观演人映射仍未审核。
-- 不得执行 `--live`，除非真实确认页 contract 已审核、Mac 演练已通过，且用户明确提供
-  `maxTotalFen`、场次顺序、票档顺序、数量和提交确认。
-- 不得添加私有 API、验证码解答、代理池、多账号/多页并发、指纹伪装、坐标点击、`force:true` 或高频刷新。
-- Cookie、实名信息、Keychain 值、Chrome profile 和支付只能留在 Mac。
-- 如果 capability 已领取、点击结果未知或存在 `HELD` lock，不得自动重试；先让用户检查官方订单。
-
-### F. 回传给用户的固定报告
-
-Mac agent 完成后应使用以下结构回复，不得包含 token、Cookie、观演人姓名、页面 HTML 或 profile 路径内容：
-
-```text
-HEAD: <git rev-parse --short HEAD>
-worktree: clean | dirty (dirty 时列文件名，不覆盖)
-macOS / Node / npm / Chrome: <版本>
-setup-macos: PASS | FAIL
-check: PASS | FAIL
-tests: <passed>/<total>
-smoke: <passed>/<total>
-benchmark loopback runs 1-3: <各轮 gate 结果和 p50/p95/p99>
-benchmark state-machine runs 1-3: <各轮 exit=0 和 p50/p95/p99；无固定 latency gate>
-benchmark trusted-click runs 1-3: <各轮 gate 结果、p50/p95/p99 和 faultChecks>
-benchmark armed-fast-path runs 1-3: <各轮 hot/trusted-click/T0-to-click 的 p50/p95/p99 和六项 faultChecks>
-default sandbox dry-run run 1: NOT_RUN | <state, observed total if present, zero-click confirmation>
-default sandbox dry-run run 2: NOT_RUN | <state, observed total if present, zero-click confirmation>
-temporary sandbox A/B: NOT_RUN | <diagnostic result only; never substitutes for the two default runs>
-rehearsal: NOT_RUN | <state, zero-submit confirmation>
-contract-rehearsal run 1: NOT_RUN | <exit、outcome、reason、digest、活动/计数/观演人脱敏证据、selectionReady、documentStable、adjacentVerified、price、readiness、reversibleActionCount、zeroSubmit/fakeClickCount、postSubmitEvidence>
-contract-rehearsal run 2: NOT_RUN | <同上；digest 必须与 run 1 完全一致>
-contract-rehearsal run 3: NOT_RUN | <同上；digest 必须与 run 1/2 完全一致>
-liveReady / fastPathReady: false / false
-profile path isolation preflight: PASS | FAIL
-sandbox / live profile mode: 0700 | NOT_CREATED | FAIL / 0700 | NOT_CREATED | FAIL
-profile locks: ABSENT | FAIL
-secrets or identity data persisted/uploaded: NO | YES
-raw benchmark JSON uploaded or added to repo: NO | YES
-blockers: <none or exact blocker>
-```
-
-定义完成：仓库包含当前功能检查点 `d3d1963`，工作树干净，基础验收通过，topology guard 回归和 12 条基准命令全部返回 0、12 份报告结构和语义有效，
-有固定性能门的三类基准全部过门，且 armed fast path 的六项 fault check 全为 1；`state-machine` 只记录三轮实测摘要。
-同一默认 sandbox 的两轮真实页 dry-run 还必须均为 `REVIEW_REQUIRED`、当前已知观测总价 `5800` 分、零点击，
-profile 为 `0700` 且无残留 runner lock；临时 profile PASS 不能替代。整个过程不得执行 rehearsal 或打开任何
-live 开关。未完成的真实大麦 selector/confirmation contract 校准必须如实列为 blocker，不能把合成基准描述为
-真实购票就绪。
-
-## 当前状态
-
-- 控制器、SQLite 审计、macOS Chrome 执行器和本地 mock 已完成。
-- 开售协调器会在远期保持 `SCHEDULED`，进入 10 分钟预热窗口后打开可见页面，并在同一官方队列页串行等待。
-- 已取得并验证一个低热度大麦官方活动链接，专用只读计划位于
-  `examples/damai-iwwf-readonly-plan.json`；真实页面 selector 和确认页尚未审核，
-  因此 `liveReady` 继续固定为 `false`。
-- 开售/官方队列等待已改为页面内 `MutationObserver` 主触发；浏览器驻留选择状态机和 T-10
-  一次性提交能力已经接成 durable controller → Mac runner → resident browser 的完整链路；精确
-  ElementHandle 可信点击、驻留 ACK、响应丢失、精确目标/证据变化/脱离/遮挡/disabled 门，以及
-  常驻期间新页、popup 或原页关闭的粘滞零点击防线均有回归测试；同一个 guard 现在从首次官方导航前
-  覆盖到 live lifecycle 结束。
-  `--live` 只能走该 fast path，不能回退旧 `LocalRunner`。但大麦真实 selector contract 尚未校准；
-  当前 legacy `DamaiAdapter` 的 rehearsal 通过也不能替代未来 live fast path 使用的同一份
-  contract-driven 无提交演练，
-  所以 `liveReady=false`、`fastPathReady=false` 仍保持关闭。隔离性能基准只表示本机理想下限，不能
-  当作真实端到端购票延迟或成功率。
-- 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。
-- 当前默认值为 1 张、可见允许票档中最低价优先；热门活动的极速配置应改用
-  `PREFERRED_ORDER`，按用户预先批准的票档顺序命中即走。未设置 `maxTotalFen` 时禁止自动提交。
-  自动提交还必须绑定带时区的 `saleAt`；该时间会成为一次性能力的签名最早提交门。
-
-账号会话和 Chrome profile 只留在用户 Mac。本项目不保存或上传密码、Cookie、身份证号和支付信息。
-
-## 验证工程
-
-需要 Node.js 22.13 或更高版本：
-
-```bash
-npm ci
 npm run check
 npm test
 npm run smoke
-npm run --silent benchmark:loopback
-npm run --silent benchmark:state-machine
-npm run --silent benchmark:trusted-click
-npm run --silent benchmark:armed-fast-path
 ```
 
-没有活动链接时，可以进行纯配置检查；它不会启动浏览器或访问网络：
-
-```bash
-npm run build
-npm run start:runner -- --dry-run --plan examples/default-damai-plan.json
-```
-
-在 Mac 上对当前校准活动进行零点击真实页检查：
-
-```bash
-npm run build
-npm run start:runner -- --dry-run \
-  --plan examples/damai-iwwf-readonly-plan.json
-```
-
-真实详情页没有订单总价时，安全停止在 `PAGE_CHANGED` 是预期结果；这用于确认需要校准的
-页面证据，不会开启选票或下单。
-
-## macOS 运行边界
-
-在 Mac 安装 Google Chrome 后运行：
+真实浏览器执行只支持用户自己的 Mac，并要求安装 Google Chrome：
 
 ```bash
 bash scripts/setup-macos.sh
 ```
 
-真实 live/rehearsal 模式和 mock/dry-run 使用两个隔离的 Chrome profile。目录拒绝符号链接、权限限制为 `0700`，并通过原子锁阻止同一 profile 同时运行两个执行器。live 与 rehearsal 都强制显示浏览器，以便验证码或登录时人工接管；rehearsal 在代码层面没有控制器授权和订单提交能力。
+不要使用日常 Chrome profile。Ticket Agent 默认把 live 和 sandbox profile 分开保存，限制为
+`0700`，并拒绝符号链接和并发 runner。
 
-本机控制器只监听 loopback。Bearer token 与 capability HMAC key 都至少 32 UTF-8 字节，且必须不同：
+## 给 macOS Agent 的交接
+
+新 agent 打开仓库后先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)。当前唯一授权的首轮动作是安全
+拉取和本地验收，不是实盘下单：
 
 ```bash
-export TICKET_AGENT_TOKEN="$(openssl rand -hex 32)"
-export TICKET_AGENT_CAPABILITY_KEY="$(openssl rand -hex 32)"
-npm run build
-npm run start:controller
+set -euo pipefail
+cd "${TICKET_AGENT_DIR:-$HOME/ticket-agent}"
+[ -z "$(git status --short)" ] || { git status --short; exit 1; }
+[ "$(git branch --show-current)" = main ] || exit 1
+git pull --ff-only origin main
+git fetch --tags origin
+git merge-base --is-ancestor v0.1.0 HEAD
+npm ci --ignore-scripts
+bash scripts/setup-macos.sh
+npm run check
+TMPDIR=/private/tmp npm test
+npm run smoke
+git status --short
 ```
 
-Mac runner 需要配置与 controller 相同的 `TICKET_AGENT_CAPABILITY_KEY`，并继续使用 Bearer token 访问
-controller。key 只在 T-10 内存中验证首次交付的 envelope，prepare 后立即清零；不会写入 SQLite、
-日志或浏览器。真实 runner 必须从控制器读取已武装 run，等待浏览器驻留 ACK 后只领取一次 capability，
-prepared ACK 成功后才允许本机消费和可信点击。普通 runner 事件不能伪造 `SUBMIT_ORDER` 或 `SUCCESS`。
-在大麦 adapter 的真实 contract 完成审核前，CLI 会拒绝 live 启动。
+最后一条必须没有输出。任何一步失败都停止；不得 `reset`、`clean`、删除 profile/lock、执行
+`--live`，也不得修改 readiness。只回传脱敏的 HEAD、版本和 check/test/smoke 结果。
 
-详细的 macOS 流程见 [docs/MACOS.md](docs/MACOS.md)，安全约束见 [docs/SECURITY.md](docs/SECURITY.md)。
+后续真实页面校准还需要用户明确提供官方活动 URL/ID/标题、数量、`maxTotalFen`、场次/票档
+顺序、连座要求和 Mac 本地 opaque attendee refs。信息完整后也只先制作仓库外 `0600` 的私有
+plan/contract，并按 [`docs/CONTRACT_REHEARSAL.md`](docs/CONTRACT_REHEARSAL.md) 做无提交演练；
+三轮通过不会自动开启 readiness。
 
-## 重要边界
+## 运行模式
 
-本项目不实现验证码破解、私有接口逆向、代理池、多账号并发、设备指纹伪造或绕过平台限购。成功率由库存和官方队列决定；“极速”仅指压低 Mac 本地可控延迟，工程目标仍包括预算不越界、不重复提交、状态可审计并且随时能够人工接管。
+| 模式 | 边界 | 当前状态 |
+| --- | --- | --- |
+| `mock` | 仅 loopback fixture，永不提交 | 可用于测试 |
+| `dry-run` | sandbox profile，只读/零点击 | 可用于人工校准 |
+| `login-only` | live 专用可见 Chrome，只允许用户手工登录 | 可用于准备会话 |
+| `contract-rehearsal` | 可逆选择 + 不可逆 click/form shield，无 controller/capability | 待真实 contract 校准 |
+| `live` | resident fast path + 一次性 capability | 被 readiness 强制阻断 |
+
+## 文档
+
+- [macOS 最短交接](docs/HANDOFF.md)
+- [macOS 完整手册](docs/MACOS.md)
+- [contract 无提交演练](docs/CONTRACT_REHEARSAL.md)
+- [安全模型](docs/SECURITY.md) 和 [漏洞报告](SECURITY.md)
+- [快路径设计](docs/FAST_PATH.md) 与 [性能口径](docs/PERFORMANCE.md)
+- [提交 capability](docs/SUBMIT_CAPABILITY.md)
+- [实施计划](docs/PLAN.md) 与 [冻结发布记录](docs/RELEASE.md)
+- [变更记录](CHANGELOG.md)
+
+## 数据与隐私
+
+不要向仓库、issue、聊天或日志提交 Cookie、账号密码、身份证信息、短信码、支付信息、
+Keychain 值、Chrome profile、页面 HTML、私有 plan/contract 或 raw benchmark JSON。
+`.gitignore` 已覆盖常见本地敏感文件，但它不能替代提交前审查。
+
+## 贡献与许可
+
+提交前阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 和
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。公开仓库采用 [MIT License](LICENSE)。
+`package.json` 保留 `private:true` 只用于阻止误发 npm registry，不影响 GitHub 源码许可。
