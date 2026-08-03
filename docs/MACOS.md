@@ -134,8 +134,9 @@ fail-closed；dry-run/mock 永远不读取 Keychain。
 
 ## 5. 无身份 selector 校准（无提交能力）
 
-以下是后续 rehearsal 流程，不是当前 Mac 复验指令。导航前 sticky topology guard 尚未覆盖 rehearsal 的
-完整生命周期；在该硬门修复、回归测试通过并收到单独执行指令前，不得运行本节命令。
+以下是后续 rehearsal 流程，不是当前基础复验指令。当前 HEAD 已在官方导航前安装 listener-first
+sticky topology guard，并用合成故障矩阵覆盖 popup/新页、原页关闭、context 关闭、初始多页和
+dispose 清理；在真实 selector/确认页 contract、用户私有约束和单独执行指令具备前，仍不得运行本节命令。
 
 登录完成后，可使用同一个可见 live 专用 profile 检查活动身份、页面边界和基础 selector：
 
@@ -175,6 +176,10 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 只有这项私有计划演练才能校准并复核活动、场次、票档、数量、观演人、总价和 submit readiness；它仍
 没有 controller/capability，也不会提交订单。
 
+注意：当前 `rehearsal` 使用的是可逆的 legacy adapter 路径。即使它停在 `REVIEW_REQUIRED`，也不能
+证明尚未配置的 `FastPathContract` 在同一页面上可用；进入 live 前必须先生成脱敏、版本化的真实
+selector/evidence contract，并让无提交验收使用与 live 完全相同的 contract/digest。
+
 ## 6. 获得大麦官方链接后
 
 1. 把官方 HTTPS 活动链接、准确活动标题/ID 和开售时间写入计划。校准计划可先只绑定活动 ID；
@@ -195,8 +200,9 @@ npm run start:runner -- --rehearsal --confirm-rehearsal \
 - plan 必须包含带明确时区的 `saleAt`；它同时作为一次性 capability 的签名最早提交时间；
 - plan 必须显式使用 `PREFERRED_ORDER`，包含非空场次/票档顺序、观演人 refs 和 `maxTotalFen`；
 - adapter 的 `liveReady`、`fastPathReady`、contract 和 contract digest 四者同时通过；
-- 默认 sandbox 两轮 dry-run、启动生命周期修复和合成性能基准都不能替代导航前 sticky topology guard、
-  真实 selector 与确认页 contract 审核；不得仅凭这些结果解除 readiness；
+- 默认 sandbox 两轮 dry-run、启动生命周期修复和合成性能基准都不能替代真实 selector 与确认页 contract
+  审核；导航前 sticky topology guard 已作为代码/回归门接入，但仍需在 Mac 基础回归中确认版本一致；不得
+  仅凭这些结果解除 readiness；
 - 浏览器 resident ACK 成功后，controller 才在首次 capability delivery 事务中取得活动购买锁；
 - 本机 prepare 与 prepared ACK 成功后才允许运行 fast path；最终可见价格必须与 capability 和 DOM
   证据逐分相同；

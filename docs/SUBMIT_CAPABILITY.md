@@ -66,9 +66,13 @@ delivery 成功后，通用 runner event 通道不得再改写该 run。prepared
 证明尚未 prepared 且零点击，controller 允许用同一 `deliveryId` 直接终结为
 `ZERO_CLICK_BLOCKED`，不伪造 prepared ACK；sticky lock 仍然保留，只能在用户核对官方无订单后人工对账。
 
-live lifecycle 还会在首次页面快照前监听 context 的拓扑变化，并在领取前、ACK 后及点击前复查
-原始页仍是唯一页。多标签、popup、新页或原页关闭会形成 sticky abort：领取前发生时零交付；
-已完成 delivery/prepared ACK 时则烧毁本地一次性能力、持久化 `ZERO_CLICK_BLOCKED` 并保持零点击。
+CLI（或其他明确的 lifecycle 调用方）必须在首次官方导航前创建 exact page-topology guard，并把同一
+实例传给 `runLiveFastPathLifecycle()`；lifecycle 会在领取前、ACK 后及点击前复查原始页仍是唯一页，
+并在结束时幂等地 `dispose()` 该 guard。多标签、popup、新页或原页关闭会形成 sticky abort：领取前
+发生时零交付；已完成 delivery/prepared ACK、但可信点击尚未派发时，则烧毁本地一次性能力、持久化
+`ZERO_CLICK_BLOCKED` 并保持零点击。若变化发生在点击已派发之后，必须如实保留
+`CLICK_DISPATCHED`/`OUTCOME_UNKNOWN`，只上报一次并要求人工核单，绝不能改写成零点击或重试。
+调用方不得在导航后才创建 guard，也不得为 lifecycle 传入另一个 page 的 guard。
 
 ## 崩溃与不确定结果
 

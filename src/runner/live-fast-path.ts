@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from "playwright-core";
+import type { Page } from "playwright-core";
 
 import type {
   ClaimSubmitCapabilityInput,
@@ -31,6 +31,10 @@ import {
   validateFastPathContract,
   type FastPathContract
 } from "./fast-path-contract.js";
+import {
+  PAGE_TOPOLOGY_INVALID,
+  type ExactPageTopologyGuard
+} from "./page-topology-guard.js";
 
 export interface LiveFastPathController {
   claimSubmitCapability(
@@ -47,6 +51,12 @@ export interface LiveFastPathController {
 
 export interface LiveFastPathLifecycleOptions {
   readonly page: Page;
+  /**
+   * Guard installed before the official navigation; this exact instance is
+   * reused for the whole lifecycle. The lifecycle owns listener cleanup and
+   * disposes it idempotently when the lifecycle ends.
+   */
+  readonly topologyGuard: ExactPageTopologyGuard;
   readonly controller: LiveFastPathController;
   readonly runId: string;
   readonly plan: WatchPlan;
@@ -78,70 +88,6 @@ interface LiveFastPathDependencies {
   readonly createArmedFastPath?: (options: ArmedFastPathOptions) => Pick<ArmedFastPath, "run">;
 }
 
-interface LivePageTopologyGuard {
-  readonly signal: AbortSignal;
-  recheck(): boolean;
-  dispose(): void;
-}
-
-const LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID = "LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID";
-
-/**
- * Installs listeners before the first snapshot so a restored tab, popup, or
- * original-page close cannot land between validation and monitoring. Once the
- * topology changes, the abort is sticky even if the extra page closes again.
- */
-function monitorExactLivePage(page: Page): LivePageTopologyGuard {
-  const context: BrowserContext = page.context();
-  const abortController = new AbortController();
-  let disposed = false;
-
-  const violate = (): void => {
-    if (!abortController.signal.aborted) {
-      abortController.abort(new Error(LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID));
-    }
-  };
-  const onNewPage = (): void => violate();
-  const onOriginalPageClose = (): void => violate();
-  const onContextClose = (): void => violate();
-
-  // Listener-first installation closes the check-then-subscribe race.
-  context.on("page", onNewPage);
-  context.on("close", onContextClose);
-  page.on("close", onOriginalPageClose);
-
-  const recheck = (): boolean => {
-    if (abortController.signal.aborted) return false;
-    try {
-      const pages = context.pages();
-      if (
-        context.isClosed() ||
-        page.isClosed() ||
-        pages.length !== 1 ||
-        pages[0] !== page
-      ) {
-        violate();
-      }
-    } catch {
-      violate();
-    }
-    return !abortController.signal.aborted;
-  };
-
-  // Immediate post-subscription snapshot.
-  recheck();
-  return {
-    signal: abortController.signal,
-    recheck,
-    dispose(): void {
-      if (disposed) return;
-      disposed = true;
-      context.off("page", onNewPage);
-      context.off("close", onContextClose);
-      page.off("close", onOriginalPageClose);
-    }
-  };
-}
 
 function requiredPlan(plan: WatchPlan): asserts plan is WatchPlan & {
   officialUrl: string;
@@ -213,8 +159,21 @@ export async function runLiveFastPathLifecycle(
   const stopResident = new AbortController();
   let runnerSessionSecret: RunnerSessionSecret | undefined;
   let resident: BrowserSelectionResidentTask | undefined;
-  let topology: LivePageTopologyGuard | undefined;
+  let topology: ExactPageTopologyGuard | undefined;
   try {
+    const suppliedTopologyGuard = options.topologyGuard as ExactPageTopologyGuard | undefined;
+    if (
+      suppliedTopologyGuard === undefined ||
+      typeof suppliedTopologyGuard.recheck !== "function" ||
+      typeof suppliedTopologyGuard.dispose !== "function"
+    ) {
+      throw new Error("LIVE_FAST_PATH_PAGE_TOPOLOGY_GUARD_REQUIRED");
+    }
+    if (suppliedTopologyGuard.page !== options.page) {
+      throw new Error("LIVE_FAST_PATH_PAGE_TOPOLOGY_GUARD_MISMATCH");
+    }
+    topology = suppliedTopologyGuard;
+    if (!topology.recheck()) throw new Error(`LIVE_FAST_PATH_${PAGE_TOPOLOGY_INVALID}`);
     if (!(capabilityKey instanceof Uint8Array) || capabilityKey.byteLength < 32) {
       throw new Error("LIVE_FAST_PATH_CAPABILITY_KEY_INVALID");
     }
@@ -226,8 +185,6 @@ export async function runLiveFastPathLifecycle(
     if (contract.platform !== options.plan.platform) throw new Error("LIVE_FAST_PATH_CONTRACT_MISMATCH");
     const contractDigest = digestFastPathContract(contract);
     const browserPlan = selectionPlan(options.plan, runtimeLabels);
-    topology = monitorExactLivePage(options.page);
-    if (!topology.recheck()) throw new Error(LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID);
     if (options.signal?.aborted) throw new Error("LIVE_FAST_PATH_ABORTED");
     const lifecycleSignal = combinedSignal(
       combinedSignal(options.signal, topology.signal),
@@ -261,7 +218,7 @@ export async function runLiveFastPathLifecycle(
     });
     void exactResident.result.catch(() => undefined);
     await exactResident.armed;
-    if (!topology.recheck()) throw new Error(LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID);
+    if (!topology.recheck()) throw new Error(`LIVE_FAST_PATH_${PAGE_TOPOLOGY_INVALID}`);
     if (lifecycleSignal.aborted) throw new Error("LIVE_FAST_PATH_ABORTED");
 
     let claimed: ClaimSubmitCapabilityResult;
@@ -326,7 +283,9 @@ export async function runLiveFastPathLifecycle(
     }
   } finally {
     stopResident.abort();
-    topology?.dispose();
+    // Keep the exported lifecycle leak-free for direct callers as well as the
+    // CLI. The CLI may also dispose the same guard; disposal is idempotent.
+    options.topologyGuard?.dispose();
     capabilityKey.fill(0);
     runnerSessionSecret?.fill(0);
     runtimeLabels.fill("");

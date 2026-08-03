@@ -497,6 +497,10 @@ test("browser-context closure is a nonzero CLI result while ordinary calibration
   } as never), 1);
   assert.equal(runnerExitCode({
     state: "PAGE_CHANGED",
+    message: "PAGE_TOPOLOGY_INVALID:after navigation"
+  } as never), 1);
+  assert.equal(runnerExitCode({
+    state: "PAGE_CHANGED",
     message: "A verified visible total was not returned"
   } as never), 0);
   assert.equal(runnerExitCode({

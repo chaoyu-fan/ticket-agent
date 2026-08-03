@@ -17,6 +17,11 @@ import { ControllerClient } from "./controller-client.js";
 import { LocalRunner, prewarmDelayMs } from "./executor.js";
 import { digestFastPathContract } from "./fast-path-contract.js";
 import { runLiveFastPathLifecycle } from "./live-fast-path.js";
+import {
+  PAGE_TOPOLOGY_INVALID,
+  startExactPageTopologyGuard,
+  type ExactPageTopologyGuard
+} from "./page-topology-guard.js";
 import { assertTarget, runnerSafetyPolicy } from "./safety.js";
 import type { RunnerMode } from "./types.js";
 
@@ -340,7 +345,8 @@ export async function waitForPrewarmWindow(
 export function runnerExitCode(result: Awaited<ReturnType<LocalRunner["run"]>>): number {
   return result.state === "FAILED" ||
     result.message.startsWith("RUNNER_FAILED:") ||
-    result.message.includes("BROWSER_CONTEXT_CLOSED:")
+    result.message.includes("BROWSER_CONTEXT_CLOSED:") ||
+    result.message.includes(PAGE_TOPOLOGY_INVALID)
     ? 1
     : 0;
 }
@@ -531,20 +537,24 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         // inherit it. A profile review wipes the in-memory copy before waiting,
         // and attendee labels are not resolved until topology preflight passes.
         const capabilityKey = takeLiveCapabilityKey();
+        let topologyGuard: ExactPageTopologyGuard | undefined;
         try {
           const context = await launchMacChrome({ profileScope: "live" });
           try {
             const page = await initializeSingleContextPage(context);
+            // Install the sticky guard before the first official navigation.
+            topologyGuard = startExactPageTopologyGuard(page);
+            topologyGuard.assertValid();
             await adapter.navigate(page, target.href);
-            if (await singleContextPage(context) !== page) {
-              throw new Error("SINGLE_PAGE_CONTEXT_REQUIRED");
-            }
+            topologyGuard.assertValid();
             const result = await withRuntimeAttendeeLabels(runnerMode, plan, async (runtimePlan) => {
+              topologyGuard!.assertValid();
               const attendeeLabels = [...runtimePlan.attendeeAliases];
               const persistedPlan: WatchPlan = { ...runtimePlan, attendeeAliases: [] };
               try {
                 return await runLiveFastPathLifecycle({
                   page,
+                  topologyGuard: topologyGuard!,
                   controller,
                   runId,
                   plan: persistedPlan,
@@ -575,6 +585,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             await waitForProfileReviewIfRequired(context, error);
             throw error;
           } finally {
+            topologyGuard?.dispose();
             await context.close();
           }
         } finally {
@@ -586,13 +597,22 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       // The profile topology is checked before Keychain resolution so a
       // restored-page review cannot retain attendee labels in process memory.
       const context = await launchMacChrome({ profileScope: runnerSafetyPolicy(nonLiveMode).profileScope });
+      let topologyGuard: ExactPageTopologyGuard | undefined;
       try {
         const page = await initializeSingleContextPage(context, {
           allowNonEmptyRestored: nonLiveMode === "dry-run" || nonLiveMode === "mock"
         });
+        if (nonLiveMode === "rehearsal") {
+          // Rehearsal uses the same pre-navigation guard as live, but never
+          // receives a controller capability or submit authority.
+          topologyGuard = startExactPageTopologyGuard(page);
+          topologyGuard.assertValid();
+        }
         return await withRuntimeAttendeeLabels(nonLiveMode, plan, async (runtimePlan) => {
+          topologyGuard?.assertValid();
           const runner = new LocalRunner({
             page,
+            ...(topologyGuard === undefined ? {} : { pageTopologyGuard: topologyGuard }),
             signal: abortController.signal,
             onEvent: (event) => {
               console.error(JSON.stringify(event));
@@ -604,6 +624,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             mode: nonLiveMode,
             ...(args.targetUrl === undefined ? {} : { targetUrl: args.targetUrl })
           });
+          if (
+            topologyGuard !== undefined &&
+            !topologyGuard.recheck() &&
+            !result.message.includes(PAGE_TOPOLOGY_INVALID)
+          ) {
+            throw new Error(PAGE_TOPOLOGY_INVALID);
+          }
           console.log(JSON.stringify(result, null, 2));
           return runnerExitCode(result);
         });
@@ -613,6 +640,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         }
         throw error;
       } finally {
+        topologyGuard?.dispose();
         await context.close();
       }
     } finally {

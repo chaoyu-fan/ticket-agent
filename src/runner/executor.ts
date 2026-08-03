@@ -12,6 +12,7 @@ import type { RunnerEvent, RunState, WatchPlan } from "../core/types.js";
 
 import { checkObservedTarget, checkRunTarget, runnerSafetyPolicy } from "./safety.js";
 import { waitForDomPredicate } from "./dom-event.js";
+import { PAGE_TOPOLOGY_INVALID } from "./page-topology-guard.js";
 import type { LocalRunnerOptions, LocalRunnerRequest, LocalRunnerResult } from "./types.js";
 
 const ACTION_PHASES: readonly {
@@ -111,15 +112,24 @@ export class LocalRunner {
   private readonly prewarmWindowMs;
   private readonly queuePollIntervalMs;
   private readonly signal;
+  private readonly pageTopologyGuard;
   private readonly checkRunActive;
 
   constructor(options: LocalRunnerOptions = {}) {
     this.page = options.page;
     this.adapterOverride = options.adapter;
+    this.pageTopologyGuard = options.pageTopologyGuard;
+    if (this.pageTopologyGuard !== undefined && (this.page === undefined || this.pageTopologyGuard.page !== this.page)) {
+      throw new Error("PAGE_TOPOLOGY_GUARD_PAGE_MISMATCH");
+    }
     this.onEvent = options.onEvent;
     this.authorizeSubmit = options.authorizeSubmit;
     this.now = options.now ?? (() => new Date());
-    this.signal = options.signal;
+    this.signal = this.pageTopologyGuard === undefined
+      ? options.signal
+      : options.signal === undefined
+        ? this.pageTopologyGuard.signal
+        : AbortSignal.any([options.signal, this.pageTopologyGuard.signal]);
     this.checkRunActive = options.checkRunActive;
     this.sleep = options.sleep ?? ((milliseconds: number) => defaultSleep(milliseconds, this.signal));
     this.prewarmWindowMs = options.prewarmWindowMs ?? DEFAULT_PREWARM_WINDOW_MS;
@@ -280,11 +290,13 @@ export class LocalRunner {
       await emit("FAILED", message);
       return result(message);
     }
-
     const checkTargetBoundary = async (
       label: string,
       explicitUrl?: string
     ): Promise<LocalRunnerResult | undefined> => {
+      if (this.pageTopologyGuard !== undefined && !this.pageTopologyGuard.recheck()) {
+        return stopForGuard("PAGE_CHANGED", `${PAGE_TOPOLOGY_INVALID}:${label}`, observedTotalFen);
+      }
       if (this.signal?.aborted) {
         return stopForGuard("FAILED", `RUN_ABORTED:${label}`, observedTotalFen);
       }
@@ -319,6 +331,18 @@ export class LocalRunner {
       try {
         signals = await adapter.inspect({ page, plan: request.plan }, adapterPhase);
       } catch (error) {
+        // A sticky topology violation must win over generic Target-closed
+        // wording. Preserve the legacy phase-specific closed-page message
+        // when no exact-page guard is installed (dry-run/mock callers).
+        if (this.pageTopologyGuard !== undefined && !this.pageTopologyGuard.recheck()) {
+          return {
+            stopped: await stopForGuard(
+              "PAGE_CHANGED",
+              `${PAGE_TOPOLOGY_INVALID}:${label}`,
+              observedTotalFen
+            )
+          };
+        }
         if (pageIsClosed(page) || isPageClosedError(error)) {
           return {
             stopped: await stopForGuard(
@@ -466,7 +490,11 @@ export class LocalRunner {
             if (stopped) return stopped;
           } else {
             if (wake.kind === "stopped") return wake.stopped;
-            if (wake.kind === "dom" && wake.result.outcome === "aborted") throw new Error("RUN_ABORTED");
+            if (wake.kind === "dom" && wake.result.outcome === "aborted") {
+              stopped = await checkTargetBoundary("after aborted sale wait");
+              if (stopped) return stopped;
+              throw new Error("RUN_ABORTED");
+            }
             stopped = await checkTargetBoundary("after event-driven sale wait");
             if (stopped) return stopped;
             if (wake.kind === "dom" && wake.result.outcome === "timeout") {
@@ -543,7 +571,11 @@ export class LocalRunner {
         }
         if (wake.kind === "stopped") return wake.stopped;
         if (wake.kind === "dom") {
-          if (wake.result.outcome === "aborted") throw new Error("RUN_ABORTED");
+          if (wake.result.outcome === "aborted") {
+            stopped = await checkTargetBoundary("after aborted official queue wait");
+            if (stopped) return stopped;
+            throw new Error("RUN_ABORTED");
+          }
           if (wake.result.outcome === "matched") pendingQueueWakeKey = wake.result.key;
         }
         stopped = await checkTargetBoundary("after event-driven official queue wait");
@@ -571,6 +603,8 @@ export class LocalRunner {
         await emit("VERIFY_PRICE", "Immutable dry-run price snapshot recorded", totalEvent(observedTotalFen));
         const message = "Dry-run complete; human review is required before any submission";
         await emit("REVIEW_REQUIRED", message, totalEvent(observedTotalFen));
+        const topologyStopped = await checkTargetBoundary("after dry-run completion");
+        if (topologyStopped) return topologyStopped;
         return result(message);
       }
 
@@ -667,11 +701,15 @@ export class LocalRunner {
           ? "Rehearsal complete; submit authorization and order submission are unavailable"
           : "Mock mode complete; live submission is unconditionally disabled";
         await emit("REVIEW_REQUIRED", message, totalEvent(observedTotalFen));
+        const topologyStopped = await checkTargetBoundary("after rehearsal completion");
+        if (topologyStopped) return topologyStopped;
         return result(message);
       }
       if (!request.plan.autoSubmitOrder) {
         const message = "Automatic submission is disabled by plan policy";
         await emit("REVIEW_REQUIRED", message, totalEvent(observedTotalFen));
+        const topologyStopped = await checkTargetBoundary("after disabled-submit completion");
+        if (topologyStopped) return topologyStopped;
         return result(message);
       }
       const approvedSession = selectedSession?.trim();
@@ -819,6 +857,14 @@ export class LocalRunner {
       await emit("PAY_REQUIRED", message, { observedTotalFen, orderReference });
       return result(message);
     } catch (error) {
+      if (this.pageTopologyGuard !== undefined && !this.pageTopologyGuard.recheck()) {
+        const message = `${PAGE_TOPOLOGY_INVALID}:runner`;
+        try {
+          return await stopForGuard("PAGE_CHANGED", message, observedTotalFen);
+        } catch {
+          return result(message);
+        }
+      }
       const closed = browserContextClosedMessage(page, error, "runner");
       if (closed !== undefined) {
         try {

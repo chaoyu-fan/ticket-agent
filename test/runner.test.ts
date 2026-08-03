@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -23,6 +24,7 @@ import { DEFAULT_MAC_CHROME_PATH, macChromeLaunchOptions, resolveMacProfileDir }
 import { assertRehearsalPlanBinding, parseRunnerArgs, waitForPrewarmWindow } from "../src/runner/cli.js";
 import { LocalRunner, prewarmDelayMs } from "../src/runner/executor.js";
 import type { LocalRunnerResult } from "../src/runner/types.js";
+import { startExactPageTopologyGuard } from "../src/runner/page-topology-guard.js";
 import { checkObservedTarget, checkRunTarget, runnerSafetyPolicy } from "../src/runner/safety.js";
 
 const TEST_ATTENDEE_REF = parseAttendeeRef("attendee:v1:123e4567-e89b-42d3-a456-426614174000");
@@ -89,6 +91,46 @@ function fakePage(initialUrl = "about:blank"): MutableFakePage {
     url: () => currentUrl,
     setUrl: (url: string) => { currentUrl = url; }
   } as unknown as MutableFakePage;
+}
+
+function guardedFakePage(initialUrl = "about:blank"): {
+  page: MutableFakePage;
+  context: EventEmitter & {
+    pages(): Page[];
+    isClosed(): boolean;
+    addPopup(): void;
+    closeCanonicalPage(): void;
+  };
+} {
+  let currentUrl = initialUrl;
+  let closed = false;
+  const pageEvents = new EventEmitter();
+  const context = new EventEmitter() as EventEmitter & {
+    pages(): Page[];
+    isClosed(): boolean;
+    addPopup(): void;
+    closeCanonicalPage(): void;
+  };
+  const page = {
+    url: () => currentUrl,
+    setUrl: (url: string) => { currentUrl = url; },
+    context: () => context,
+    isClosed: () => closed,
+    on: pageEvents.on.bind(pageEvents),
+    off: pageEvents.off.bind(pageEvents)
+  } as unknown as MutableFakePage;
+  context.pages = () => [page as unknown as Page];
+  context.isClosed = () => false;
+  context.addPopup = () => {
+    context.emit("page", {});
+  };
+  context.closeCanonicalPage = () => {
+    if (closed) return;
+    closed = true;
+    context.pages = () => [];
+    pageEvents.emit("close", page);
+  };
+  return { page, context };
 }
 
 function eventDrivenFakePage(
@@ -778,6 +820,84 @@ test("rehearsal permits visible selections with liveReady false but has zero aut
   assert.equal(result.events.some((event) => event.state === "SUBMIT_ORDER"), false);
   assert.equal(result.events.some((event) => event.state === "PAY_REQUIRED"), false);
   assertResultConsistent(result);
+});
+
+test("rehearsal maps a sticky popup during navigation to PAGE_CHANGED and never reports review", async () => {
+  const adapter = new FakeDamaiAdapter(false);
+  const current = guardedFakePage();
+  const topologyGuard = startExactPageTopologyGuard(current.page as unknown as Page);
+  adapter.navigate = async (page, url) => {
+    (page as MutableFakePage).setUrl(url);
+    current.context.addPopup();
+  };
+  try {
+    const result = await new LocalRunner({
+      page: current.page,
+      pageTopologyGuard: topologyGuard,
+      adapter
+    }).run({
+      runId: "run-rehearsal-topology-popup",
+      plan: autoLivePlan(),
+      mode: "rehearsal"
+    });
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.match(result.message, /^PAGE_TOPOLOGY_INVALID:/);
+    assert.equal(adapter.actionCount, 0);
+    assert.equal(result.message.includes("REVIEW_REQUIRED"), false);
+    assertResultConsistent(result);
+  } finally {
+    topologyGuard.dispose();
+  }
+});
+
+test("rehearsal prioritizes sticky topology over a Target-closed inspect error", async () => {
+  const adapter = new FakeDamaiAdapter(false);
+  const current = guardedFakePage();
+  const topologyGuard = startExactPageTopologyGuard(current.page as unknown as Page);
+  adapter.onInspect = () => {
+    current.context.closeCanonicalPage();
+    throw new Error("locator.count: Target page, context or browser has been closed");
+  };
+  try {
+    const result = await new LocalRunner({
+      page: current.page,
+      pageTopologyGuard: topologyGuard,
+      adapter
+    }).run({
+      runId: "run-rehearsal-topology-closed-inspect",
+      plan: autoLivePlan(),
+      mode: "rehearsal"
+    });
+    assert.equal(result.state, "PAGE_CHANGED");
+    assert.match(result.message, /^PAGE_TOPOLOGY_INVALID:/);
+    assert.doesNotMatch(result.message, /Target page|locator\.count|BROWSER_CONTEXT_CLOSED/);
+    assert.equal(adapter.actionCount, 0);
+    assertResultConsistent(result);
+  } finally {
+    topologyGuard.dispose();
+  }
+});
+
+test("rehearsal keeps REVIEW_REQUIRED when the exact page remains stable", async () => {
+  const adapter = new FakeDamaiAdapter(false);
+  const current = guardedFakePage();
+  const topologyGuard = startExactPageTopologyGuard(current.page as unknown as Page);
+  try {
+    const result = await new LocalRunner({
+      page: current.page,
+      pageTopologyGuard: topologyGuard,
+      adapter
+    }).run({
+      runId: "run-rehearsal-topology-stable",
+      plan: autoLivePlan(),
+      mode: "rehearsal"
+    });
+    assert.equal(result.state, "REVIEW_REQUIRED");
+    assert.equal(topologyGuard.recheck(), true);
+    assertResultConsistent(result);
+  } finally {
+    topologyGuard.dispose();
+  }
 });
 
 test("rehearsal fails closed on a cross-origin redirect before authorization or submit", async () => {

@@ -9,7 +9,48 @@
 `main` 的 HEAD 更新，但当前 `main` 必须包含该基线。仓库固定为
 `https://github.com/chaoyu-fan/ticket-agent.git` 的 `main` 分支。
 
-**本轮只执行 A–D、遵守 E，并按 F 回传。** 完成后必须停止并回传报告；不要启动 controller、创建或武装实盘计划，
+当前 HEAD 还包含导航前的 sticky page-topology guard：它在官方导航前先监听
+context 的 `page` 事件、原页 `close` 和 context `close`，并持续校验唯一 canonical page 的对象身份；任何
+popup/新页、原页关闭、context 关闭或页面集合变化都会粘滞 abort，即使 popup 随后关闭也不会恢复。
+`rehearsal` 和 `live` 复用同一个 guard 实例，`LocalRunner` 会把拓扑变化归一化为
+状态 `PAGE_CHANGED`、消息 `PAGE_TOPOLOGY_INVALID:<phase>`；live fast path 的异常消息为
+`LIVE_FAST_PATH_PAGE_TOPOLOGY_INVALID`。guard 的合成故障矩阵和生命周期清理已有回归测试。
+CLI 是官方 rehearsal/live 入口；直接调用 `LocalRunner` 的库集成也应自行传入同一类 guard。这只证明
+代码层面的零点击防线，不等于真实大麦 selector、确认页 contract 或 `liveReady` 已审核。
+
+### 已完成 `763124c` 验收时的增量路径
+
+只有 Mac 已回传 `HEAD=763124c`、工作树干净、`269/269`、`smoke 7/7`、四类 benchmark 三轮通过，且
+默认 sandbox 两次 dry-run 都是 `REVIEW_REQUIRED / 5800 分 / 零点击` 时，才使用本节；否则执行后面的
+完整 A–F。增量复验不重复 benchmark 或真实页 dry-run，因为本次只增加官方模式的冷路径 topology guard，
+并且 dry-run 不启用该 guard：
+
+```bash
+set -e
+cd /Users/jakefan/ticket-agent
+[ -z "$(git status --short)" ] || { git status --short; exit 1; }
+[ "$(git branch --show-current)" = main ] || exit 1
+origin_url="$(git remote get-url origin)"
+case "${origin_url%/}" in
+  https://github.com/chaoyu-fan/ticket-agent.git|https://github.com/chaoyu-fan/ticket-agent|\
+  git@github.com:chaoyu-fan/ticket-agent.git|git@ssh.github.com:chaoyu-fan/ticket-agent.git) ;;
+  *) echo "origin 不是 ticket-agent GitHub 仓库：$origin_url" >&2; exit 1 ;;
+esac
+git pull --ff-only origin main
+git merge-base --is-ancestor 763124c HEAD
+npm ci --ignore-scripts
+bash scripts/setup-macos.sh
+npm run check
+TMPDIR=/private/tmp npm test
+npm run smoke
+git status --short
+```
+
+预期 `279/279` 和 `7/7`；`git status --short` 必须为空。只回传新 HEAD、上述三项结果、
+`liveReady=false / fastPathReady=false`、未执行 rehearsal/live、未持久化或上传秘密。任何失败都停止，
+不得 `reset`、`clean`、删除 profile/lock 或用旧报告覆盖新失败。
+
+**不满足增量路径前置条件时，本轮只执行 A–D、遵守 E，并按 F 回传。** 完成后必须停止并回传报告；不要启动 controller、创建或武装实盘计划，
 不要执行 `rehearsal` 或 `--live`，也不要自行修改 readiness 开关。本节后面的 rehearsal/controller/live 说明只是后续设计文档，
 不是本轮执行指令。
 
@@ -113,7 +154,7 @@ npm --version
 
 - `setup-macos.sh` 的 Chrome、路径隔离和符号链接预检成功；该脚本不会创建 profile，runner 首次使用时才会安全创建并设为 `0700`；
 - `npm run check` 成功；
-- 当前基线的测试应为 `269/269` 通过；
+- 当前基线（含 topology guard 回归）的测试应为 `279/279` 通过；
 - `npm run smoke` 应为 `7/7` mock 场景通过。
 
 ### C. Mac 性能验收
@@ -198,7 +239,9 @@ npm run start:runner -- --login-only \
 
 `login-only` 不读取计划、不选择票档且没有下单能力。它保留恢复标签并等待整个 TicketAgent 浏览器关闭；
 只关闭新开的登录标签时，若仍有其他恢复页，runner 和 profile lock 会继续等待。本轮即使登录完成也不得执行
-`rehearsal`：导航前 sticky topology guard 尚未覆盖其完整生命周期。后续修复并经单独指令确认后，才按
+`rehearsal`：导航前 sticky topology guard 的代码生命周期已经覆盖并通过合成回归，但当前没有用户批准的
+真实 selector/确认页 contract、`maxTotalFen`、场次/票档顺序和数量。待用户提供这些约束、Mac 生成脱敏
+selector 证据并收到单独执行指令后，才按
 [docs/MACOS.md](docs/MACOS.md) 的无提交流程演练。没有用户明确提供的 `maxTotalFen`、场次/票档顺序、数量
 和 Mac 本地私有计划时，不得猜测或补造这些字段。遇到 CAPTCHA、短信/人脸验证、登录异常、页面改版或跳出
 官方域名时，停止并交给用户，不得尝试绕过。
@@ -255,7 +298,8 @@ exit "$profile_status"
 ### E. 必须保持的禁止项
 
 - 不得把大麦 `liveReady` 或 `fastPathReady` 改为 `true`；猫眼也继续 fail-closed。
-- 本轮不得执行 `rehearsal`；其导航前 sticky topology guard 尚未完成独立验收。
+- 本轮不得执行 `rehearsal`；虽然导航前 sticky topology guard 已完成代码和合成故障验收，真实活动
+  selector/确认页 contract、预算和观演人映射仍未审核。
 - 不得执行 `--live`，除非真实确认页 contract 已审核、Mac 演练已通过，且用户明确提供
   `maxTotalFen`、场次顺序、票档顺序、数量和提交确认。
 - 不得添加私有 API、验证码解答、代理池、多账号/多页并发、指纹伪装、坐标点击、`force:true` 或高频刷新。
@@ -291,7 +335,7 @@ raw benchmark JSON uploaded or added to repo: NO | YES
 blockers: <none or exact blocker>
 ```
 
-定义完成：仓库包含 `d0e8e77`，工作树干净，基础验收通过，12 条基准命令全部返回 0、12 份报告结构和语义有效，
+定义完成：仓库包含 `d0e8e77`，工作树干净，基础验收通过，topology guard 回归和 12 条基准命令全部返回 0、12 份报告结构和语义有效，
 有固定性能门的三类基准全部过门，且 armed fast path 的六项 fault check 全为 1；`state-machine` 只记录三轮实测摘要。
 同一默认 sandbox 的两轮真实页 dry-run 还必须均为 `REVIEW_REQUIRED`、当前已知观测总价 `5800` 分、零点击，
 profile 为 `0700` 且无残留 runner lock；临时 profile PASS 不能替代。整个过程不得执行 rehearsal 或打开任何
@@ -308,8 +352,11 @@ live 开关。未完成的真实大麦 selector/confirmation contract 校准必�
 - 开售/官方队列等待已改为页面内 `MutationObserver` 主触发；浏览器驻留选择状态机和 T-10
   一次性提交能力已经接成 durable controller → Mac runner → resident browser 的完整链路；精确
   ElementHandle 可信点击、驻留 ACK、响应丢失、精确目标/证据变化/脱离/遮挡/disabled 门，以及
-  常驻期间新页、popup 或原页关闭的粘滞零点击防线均有回归测试。
-  `--live` 只能走该 fast path，不能回退旧 `LocalRunner`。但大麦真实 selector contract 尚未校准，
+  常驻期间新页、popup 或原页关闭的粘滞零点击防线均有回归测试；同一个 guard 现在从首次官方导航前
+  覆盖到 live lifecycle 结束。
+  `--live` 只能走该 fast path，不能回退旧 `LocalRunner`。但大麦真实 selector contract 尚未校准；
+  当前 legacy `DamaiAdapter` 的 rehearsal 通过也不能替代未来 live fast path 使用的同一份
+  contract-driven 无提交演练，
   所以 `liveReady=false`、`fastPathReady=false` 仍保持关闭。隔离性能基准只表示本机理想下限，不能
   当作真实端到端购票延迟或成功率。
 - 猫眼适配器目前是 fail-closed 占位，不会猜测复用大麦选择器。

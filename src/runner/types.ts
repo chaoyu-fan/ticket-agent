@@ -2,6 +2,7 @@ import type { Page } from "playwright-core";
 
 import type { RunnerEvent, WatchPlan } from "../core/types.js";
 import type { TicketPlatformAdapter } from "../adapters/types.js";
+import type { ExactPageTopologyGuard } from "./page-topology-guard.js";
 
 /** A mode is deliberately required; there is no implicit live mode. */
 export type RunnerMode = "dry-run" | "mock" | "rehearsal" | "live";
@@ -16,6 +17,12 @@ export interface LocalRunnerRequest {
 
 export interface LocalRunnerOptions {
   page?: Page;
+  /**
+   * Exact-page guard used by the official CLI rehearsal path. Direct library
+   * callers should provide the guard for official modes; it remains optional
+   * for backwards-compatible dry-run/mock and synthetic callers.
+   */
+  pageTopologyGuard?: ExactPageTopologyGuard;
   adapter?: TicketPlatformAdapter;
   onEvent?: (event: RunnerEvent) => void | Promise<void>;
   /**

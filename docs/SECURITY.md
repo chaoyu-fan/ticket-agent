@@ -43,10 +43,11 @@ Chrome 子进程环境会显式剔除 controller Bearer token 与 capability key
 Mac ref→Keychain label→选中 DOM 闭环、同步一次消费、最终证据复核和点击后上报已经接成 live 专用
 授权链路。grant 存在后通用 runner event 不得改写 run；prepared ACK 和 attempt 会在事务内再核对
 `PREWARM` run、`RUNNING` plan、`HELD` lock 及完整绑定。首次 delivery envelope 不持久化且绝不重发；
-ACK 失败零点击，页面拓扑违反会粘滞取消，点击异常不重试。当前剩余的
-上线硬门包括大麦真实页面 selector/evidence contract、Mac 无提交确认页演练，以及从官方导航前开始的
-sticky page-topology guard。当前 guard 尚未覆盖 rehearsal/live 的完整导航窗口，因此这两个模式不得用于本轮
-Mac 验收。浏览器启动生命周期修复、默认 sandbox 连续两次 dry-run 和合成 Chrome 基准都不能据此开启 live。
+ACK 失败零点击，页面拓扑违反会粘滞取消，点击异常不重试。导航前 sticky page-topology guard 已由
+CLI 在首次官方导航前创建，并将同一实例传入 rehearsal/live lifecycle；合成回归覆盖新页、popup、原页
+关闭、context 关闭和 listener 清理。当前剩余的上线硬门包括大麦真实页面 selector/evidence contract、
+Mac 无提交确认页演练和 contract-driven 验收；guard 的代码测试通过、浏览器启动生命周期修复、默认
+sandbox 连续两次 dry-run 或合成 Chrome 基准都不能据此开启 live。
 
 Controller Bearer token 与 `TICKET_AGENT_CAPABILITY_KEY` 必须是两把不同的至少 32 字节 secret，且都
 不得进入日志、SQLite、浏览器、计划或仓库。当前 capability 使用 HMAC：个人 Mac 与 controller 属于

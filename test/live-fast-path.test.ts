@@ -33,6 +33,7 @@ import {
   type LiveFastPathController
 } from "../src/runner/live-fast-path.js";
 import { FAST_PATH_CONTRACT_VERSION, type FastPathContract } from "../src/runner/fast-path-contract.js";
+import { startExactPageTopologyGuard } from "../src/runner/page-topology-guard.js";
 
 const CAPABILITY_KEY_TEXT = "live-fast-path-test-key-at-least-thirty-two-bytes";
 const ATTENDEE_REF = parseAttendeeRef("attendee:v1:550e8400-e29b-41d4-a716-446655440000");
@@ -237,6 +238,7 @@ class FakeController implements LiveFastPathController {
   failAck = false;
   failReport = false;
   afterAck: (() => void) | undefined;
+  beforeReport: (() => void) | undefined;
   readonly reportedOutcomes: SubmitAttemptOutcome[] = [];
   readonly nowMs: number;
   readonly watchPlan: WatchPlan;
@@ -306,6 +308,7 @@ class FakeController implements LiveFastPathController {
     outcome: SubmitAttemptOutcome
   ): Promise<SubmitCapabilityGrant> {
     this.events.push("report");
+    this.beforeReport?.();
     this.reportedOutcomes.push(outcome);
     if (this.failReport) throw new Error("synthetic report loss");
     return grant(runId, deliveryId, SHA256_A, outcome, this.nowMs, outcome);
@@ -318,6 +321,7 @@ function harness(options: { armedImmediately?: boolean; realArmedFastPath?: bool
   const events: string[] = [];
   const controller = new FakeController(events, watchPlan, nowMs);
   const livePage = livePageFixture();
+  const topologyGuard = startExactPageTopologyGuard(livePage.page.asPage());
   const residency = deferred();
   if (options.armedImmediately === true) residency.resolve();
   const capabilityKey = new Uint8Array(Buffer.from(CAPABILITY_KEY_TEXT, "utf8"));
@@ -354,6 +358,7 @@ function harness(options: { armedImmediately?: boolean; realArmedFastPath?: bool
   };
   const run = () => runLiveFastPathLifecycle({
     page: livePage.page.asPage(),
+    topologyGuard,
     controller,
     runId: "run-live-fast-path",
     plan: watchPlan,
@@ -391,6 +396,8 @@ test("live fast-path waits for resident ACK, claims once, clicks once, then repo
   assert.deepEqual(current.events, ["resident-start", "claim", "ack", "armed-created", "click", "report"]);
   assert.equal(current.controller.claimCount, 1);
   assert.equal(current.armedFactoryCount, 1);
+  assert.equal(current.livePage.context.listenerCount("page"), 0);
+  assert.equal(current.livePage.page.listenerCount("close"), 0);
   assert.deepEqual([...current.capabilityKey], new Array(current.capabilityKey.length).fill(0));
   assert.deepEqual([...current.sessionSecret], new Array(32).fill(0));
 });
@@ -425,6 +432,18 @@ test("post-click report failure returns UNKNOWN and never retries the click or r
   assert.deepEqual(current.events, ["resident-start", "claim", "ack", "armed-created", "click", "report"]);
   assert.equal(current.events.filter((event) => event === "click").length, 1);
   assert.equal(current.events.filter((event) => event === "report").length, 1);
+});
+
+test("a topology change after click is reported once for reconciliation and never retried", async () => {
+  const current = harness({ armedImmediately: true });
+  current.controller.beforeReport = () => { current.livePage.context.addPage(); };
+  const result = await current.run();
+  assert.equal(result.reportStatus, "RECORDED");
+  assert.equal(result.fastPath.outcome, "CLICK_DISPATCHED");
+  assert.deepEqual(current.controller.reportedOutcomes, ["CLICK_DISPATCHED"]);
+  assert.equal(current.events.filter((event) => event === "click").length, 1);
+  assert.equal(current.events.filter((event) => event === "report").length, 1);
+  assert.equal(current.livePage.context.listenerCount("page"), 0);
 });
 
 test("missing explicit budget fails before residency or delivery and wipes the supplied key", async () => {

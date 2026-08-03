@@ -6,3 +6,4 @@ export * from "./browser-selection-state-machine.js";
 export * from "./fast-path-contract.js";
 export * from "./armed-fast-path.js";
 export * from "./live-fast-path.js";
+export * from "./page-topology-guard.js";
